@@ -1,0 +1,106 @@
+"""Tests for vision session move detection."""
+
+import chess
+
+from chess_web_ui.vision_session import VisionSession
+
+
+def _starting_cells() -> list[bool]:
+    cells = [False] * 64
+    for idx in range(16):
+        cells[idx] = True
+    for idx in range(48, 64):
+        cells[idx] = True
+    return cells
+
+
+def test_initial_scan_sets_baseline() -> None:
+    session = VisionSession()
+    cells = _starting_cells()
+    outcome = session.apply_initial_scan(cells)
+    assert outcome.success
+    assert session.previous_cells == cells
+
+
+def test_detect_e2e4() -> None:
+    session = VisionSession()
+    before = _starting_cells()
+    session.apply_initial_scan(before)
+
+    after = list(before)
+    after[12] = False  # e2
+    after[28] = True   # e4
+    outcome = session.apply_player_move_scan(after)
+    assert outcome.success
+    assert outcome.from_square == 'e2'
+    assert outcome.to_square == 'e4'
+
+
+def test_detect_e2e4_when_e2_still_reads_occupied() -> None:
+    """Depth noise: e2 stays occupied in scan but e4 becomes occupied."""
+    session = VisionSession()
+    before = _starting_cells()
+    session.apply_initial_scan(before)
+
+    after = list(before)
+    # e2 left True on purpose
+    after[28] = True  # e4
+    outcome = session.apply_player_move_scan(after)
+    assert outcome.success
+    assert outcome.from_square == 'e2'
+    assert outcome.to_square == 'e4'
+
+
+def test_detect_d7d5_when_d7_still_reads_occupied() -> None:
+    session = VisionSession()
+    before = _starting_cells()
+    session.apply_initial_scan(before)
+
+    after = list(before)
+    after[35] = True  # d5
+    outcome = session.apply_player_move_scan(after)
+    assert outcome.success
+    assert outcome.from_square == 'd7'
+    assert outcome.to_square == 'd5'
+    board = chess.Board(outcome.fen)
+    assert board.piece_at(chess.parse_square('d5')) is not None
+    assert board.piece_at(chess.parse_square('d7')) is None
+
+
+def test_detect_d7d5_after_e2e4() -> None:
+    session = VisionSession()
+    before = _starting_cells()
+    session.apply_initial_scan(before)
+
+    after_white = list(before)
+    after_white[12] = False
+    after_white[28] = True
+    session.apply_player_move_scan(after_white)
+
+    after_black = list(after_white)
+    after_black[51] = False
+    after_black[35] = True
+    outcome = session.apply_player_move_scan(after_black)
+    assert outcome.success
+    assert outcome.from_square == 'd7'
+    assert outcome.to_square == 'd5'
+    board = chess.Board(outcome.fen)
+    assert board.piece_at(chess.parse_square('d7')) is None
+    assert board.piece_at(chess.parse_square('d5')) is not None
+
+
+def test_apply_robot_move_updates_occupancy() -> None:
+    session = VisionSession()
+    before = _starting_cells()
+    session.apply_initial_scan(before)
+
+    after = list(before)
+    after[12] = False  # e2
+    after[28] = True   # e4
+    session.apply_player_move_scan(after)
+
+    outcome = session.apply_robot_move(4, 6, 4, 4)  # e7 -> e5
+    assert outcome.success
+    assert session.previous_cells is not None
+    assert session.previous_cells[52] is False
+    assert session.previous_cells[36] is True

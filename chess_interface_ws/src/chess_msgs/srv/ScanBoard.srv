@@ -1,0 +1,5 @@
+# Request an on-demand board snapshot from the vision pipeline.
+---
+BoardState board_state
+bool success
+string message

@@ -1,0 +1,4 @@
+pick_place_node:
+  ros__parameters:
+    publish_board_state: false
+    discard_joints: [-1.33, -24.77, 109.43, -0.02, 95.34, -1.07]

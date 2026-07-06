@@ -1,0 +1,4 @@
+# Move the arm-mounted camera to the top-view observation pose.
+---
+bool success
+string message

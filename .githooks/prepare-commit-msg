@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# commit-msg보다 먼저 실행 — Cursor가 메시지에 trailer를 넣는 경우 대비
+set -euo pipefail
+
+MSG_FILE="${1:?}"
+[[ -f "${MSG_FILE}" ]] || exit 0
+
+sed -i \
+  -e '/^Co-authored-by:.*[Cc]ursor/d' \
+  -e '/cursoragent@cursor\.com/d' \
+  -e '/^Made-with:.*[Cc]ursor/I d' \
+  -e '/^Co-authored-by:.*ROKEY-SPARK/d' \
+  "${MSG_FILE}"

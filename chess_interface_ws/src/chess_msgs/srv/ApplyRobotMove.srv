@@ -1,0 +1,7 @@
+# Apply a robot move to vision game state without vision scan.
+ChessMove move
+---
+bool success
+string message
+string fen
+BoardState board_state

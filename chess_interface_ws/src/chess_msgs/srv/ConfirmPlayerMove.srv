@@ -1,0 +1,9 @@
+# Trigger observe pose + vision scan to detect the user's move.
+---
+bool success
+string message
+string from_square
+string to_square
+string captured_piece
+string fen
+BoardState board_state

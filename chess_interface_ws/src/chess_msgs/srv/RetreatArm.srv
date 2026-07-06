@@ -1,0 +1,4 @@
+# Move the arm to a safe home pose away from the board.
+---
+bool success
+string message

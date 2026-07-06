@@ -1,0 +1,37 @@
+occupancy_node:
+  ros__parameters:
+    # top view: webcam(개발) | topic(RealSense ROS)
+    camera_source: "webcam"
+    camera_topic: "/camera/camera/color/image_raw"
+    webcam_device: 0
+    camera_width: 1280
+    camera_height: 720
+    settling_time_ms: 300
+    stable_frame_count: 3
+    yolo_model_path: "yamero999/chess-piece-detection-yolo11n"
+    yolo_conf: 0.45
+    yolo_iou: 0.5
+    yolo_imgsz: 416
+    yolo_device: ""
+    # 보드 자동 검출 실패 시 수동 4코너 [x1,y1, x2,y2, x3,y3, x4,y4] (TL,TR,BR,BL)
+    board_manual_corners: []
+    publish_debug_image: true
+    debug_image_topic: "vision/debug/top_view"
+    use_starting_occupancy_on_failure: false
+
+piece_classifier_node:
+  ros__parameters:
+    # side view: 기본 웹캠 device 1 (0은 탑뷰와 겹치지 않게)
+    camera_source: "webcam"
+    camera_topic: ""
+    webcam_device: 1
+    camera_width: 1920
+    camera_height: 1080
+    model_path: "yamero999/chess-piece-detection-yolo11n"
+    conf_threshold: 0.45
+    iou_threshold: 0.5
+    imgsz: 416
+    device: ""
+    publish_debug_image: true
+    debug_image_topic: "vision/debug/side_view"
+    publish_rate_hz: 2.0

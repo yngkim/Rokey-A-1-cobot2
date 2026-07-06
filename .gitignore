@@ -1,0 +1,27 @@
+# ROS2 colcon
+**/build/
+**/install/
+**/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node / frontend
+**/node_modules/
+**/dist/
+**/.vite/
+tsconfig.tsbuildinfo
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# External vendor (clone separately — see README)
+robot_ws/src/doosan-robot2/
+cobot_ws/

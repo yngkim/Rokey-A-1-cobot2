@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>chess_orchestrator</name>
+  <version>0.1.0</version>
+  <description>Central game orchestrator for vision, engine, and robot</description>
+  <maintainer email="rokey@todo.todo">rokey</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>chess_msgs</depend>
+  <depend>chess_game</depend>
+  <depend>chess_engine</depend>
+  <depend>chess_coach</depend>
+  <depend>chess_dialogue</depend>
+  <depend>action_msgs</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>chess_ui</exec_depend>
+  <exec_depend>chess_occupancy</exec_depend>
+  <exec_depend>chess_pick_place</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

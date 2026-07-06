@@ -1,0 +1,50 @@
+occupancy_node:
+  ros__parameters:
+    # cobot2_ws ImgNode: /camera/camera/color/image_raw
+    camera_source: "realsense"
+    camera_topic: "/camera/camera/color/image_raw"
+    webcam_device: 0
+    camera_width: 1280
+    camera_height: 720
+    settling_time_ms: 300
+    stable_frame_count: 3
+    yolo_model_path: "yamero999/chess-piece-detection-yolo11n"
+    yolo_conf: 0.13
+    yolo_iou: 0.50
+    yolo_imgsz: 640
+    yolo_device: ""
+    yolo_preprocess: true
+    yolo_multi_pass: true
+    yolo_enabled: false
+    yolo_warp_board: true
+    warp_board_size: 960
+    heuristic_fallback: true
+    board_flip_files: true
+    depth_occupancy_enabled: true
+    empty_depth_reference_path: "/home/rokey/vision_ws/src/chess_vision_bringup/config/empty_board_depth.npz"
+    depth_occupancy_threshold_mm: 3.0
+    depth_occupancy_min_conf: 0.25
+    # observe 자세 — capture_observe_frame + calibrate_corners로 재측정
+    board_manual_corners: [402, 69, 958, 51, 971, 600, 419, 616]
+    publish_debug_image: true
+    debug_image_topic: "vision/debug/top_view"
+    use_starting_occupancy_on_failure: false
+    live_preview_enabled: true
+    live_preview_rate_hz: 2.0
+    publish_live_occupancy: true
+
+piece_classifier_node:
+  ros__parameters:
+    camera_source: "webcam"
+    camera_topic: ""
+    webcam_device: 1
+    camera_width: 1920
+    camera_height: 1080
+    model_path: "yamero999/chess-piece-detection-yolo11n"
+    conf_threshold: 0.45
+    iou_threshold: 0.5
+    imgsz: 416
+    device: ""
+    publish_debug_image: true
+    debug_image_topic: "vision/debug/side_view"
+    publish_rate_hz: 2.0

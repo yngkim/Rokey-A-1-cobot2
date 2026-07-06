@@ -1,0 +1,33 @@
+pick_place_node:
+  ros__parameters:
+    anchor_a1: [590.274, 135.736]
+    square_size_mm: 40.0
+    # A1에서 말 잡을 때 TCP (내려온 pick 포즈)
+    z_pick_mm: 291.273
+    # XY 이동 시 pick보다 9cm 위
+    z_travel_clearance_mm: 90.0
+    z_travel_mm: 381.273
+    fixed_orientation: [2.805, 179.832, 2.749]
+    gripper_open_width: 315
+    gripper_close_width: 0
+    gripper_force: 100
+    gripper_name: rg2
+    gripper_ip: "192.168.1.1"
+    gripper_port: "502"
+    velocity: 120.0
+    acceleration: 120.0
+    pick_velocity: 80.0
+    pick_acceleration: 80.0
+    place_velocity: 35.0
+    place_acceleration: 35.0
+    retreat_velocity: 60.0
+    retreat_acceleration: 60.0
+    home_velocity: 50.0
+    home_acceleration: 50.0
+    z_approach_offset_mm: 25.0
+    robot_id: dsr01
+    robot_model: m0609
+    home_joints: [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17]
+    discard_joints: [-1.33, -24.77, 109.43, -0.02, 95.34, -1.07]
+    # observe 탑뷰 홈 (teach pendant로 측정 후 교체). vision_manual 모드에서는 publish false.
+    publish_board_state: true

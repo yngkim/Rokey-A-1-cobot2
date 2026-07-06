@@ -1,0 +1,8 @@
+# Execute a physical pick-and-place move on the board.
+ChessMove move
+---
+bool success
+string message
+---
+uint8 progress
+string status

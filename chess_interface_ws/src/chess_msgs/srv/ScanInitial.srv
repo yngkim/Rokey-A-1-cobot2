@@ -1,0 +1,6 @@
+# Trigger an initial board occupancy scan (game setup).
+---
+bool success
+string message
+string fen
+BoardState board_state
