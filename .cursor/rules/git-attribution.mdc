@@ -1,8 +1,0 @@
----
-description: Git commit attribution rules for this repository
-alwaysApply: true
----
-
-Never add "Co-authored-by: Cursor", "Made with Cursor", "cursoragent@cursor.com", or any Cursor/agent attribution to commits or PRs.
-
-When creating commits, use only the repository author identity (yngkim). Do not use ROKEY-SPARK or Cursor Agent as author or co-author.

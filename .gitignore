@@ -19,6 +19,7 @@ tsconfig.tsbuildinfo
 # IDE / OS
 .idea/
 .vscode/
+.cursor/rules/
 *.swp
 .DS_Store
 
