@@ -108,14 +108,20 @@ def depth_occupancy_warped(
     warp_size: int,
     threshold_mm: float = 4.0,
     min_conf: float = 0.30,
+    cell_percentile: float = 20.0,
 ) -> tuple[list[bool], list[float], np.ndarray]:
     """Mark cells occupied when depth is closer than empty-board reference."""
     import cv2
 
-    current_medians = cell_medians_from_warped_depth(warped_depth, warp_size)
+    current_medians = cell_medians_from_warped_depth(
+        warped_depth,
+        warp_size,
+        percentile=cell_percentile,
+    )
     cells = [False] * 64
     confidence = [0.0] * 64
     diff_grid = np.zeros((8, 8), dtype=np.float32)
+    conf_scale = max(threshold_mm * 2.0, 0.5)
 
     for row in range(8):
         for col in range(8):
@@ -129,7 +135,7 @@ def depth_occupancy_warped(
                 continue
             idx = row * 8 + col
             cells[idx] = True
-            confidence[idx] = min(delta / max(threshold_mm * 3.0, 1.0), 1.0)
+            confidence[idx] = min(delta / conf_scale, 1.0)
             if confidence[idx] < min_conf:
                 cells[idx] = False
                 confidence[idx] = 0.0
@@ -261,6 +267,7 @@ def _scan_warped(
     empty_depth_reference: np.ndarray | None = None,
     depth_threshold_mm: float = 4.0,
     depth_min_conf: float = 0.30,
+    depth_cell_percentile: float = 20.0,
     depth_occupancy_enabled: bool = True,
     yolo_enabled: bool = True,
 ) -> ScanResult:
@@ -294,6 +301,7 @@ def _scan_warped(
             warp_size,
             threshold_mm=depth_threshold_mm,
             min_conf=depth_min_conf,
+            cell_percentile=depth_cell_percentile,
         )
         cells, confidence = depth_cells, depth_conf
         if yolo_enabled:
@@ -344,6 +352,7 @@ def scan_board(
     empty_depth_reference: np.ndarray | None = None,
     depth_threshold_mm: float = 4.0,
     depth_min_conf: float = 0.30,
+    depth_cell_percentile: float = 20.0,
     depth_occupancy_enabled: bool = True,
     yolo_enabled: bool = True,
 ) -> ScanResult:
@@ -377,6 +386,7 @@ def scan_board(
             empty_depth_reference=empty_depth_reference,
             depth_threshold_mm=depth_threshold_mm,
             depth_min_conf=depth_min_conf,
+            depth_cell_percentile=depth_cell_percentile,
             depth_occupancy_enabled=depth_occupancy_enabled,
             yolo_enabled=yolo_enabled,
         )

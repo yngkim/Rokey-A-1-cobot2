@@ -1,9 +1,16 @@
 # Trigger observe pose + vision scan to detect the user's move.
+# Optional: apply promotion without rescan when from_square/to_square/promotion_piece are set.
+string promotion_piece
+string from_square
+string to_square
 ---
 bool success
 string message
 string from_square
 string to_square
+string uci
+string promotion_piece
 string captured_piece
 string fen
 BoardState board_state
+bool promotion_required

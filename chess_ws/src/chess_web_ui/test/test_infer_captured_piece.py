@@ -29,5 +29,5 @@ def test_no_capture_when_noise_departed_extra_square() -> None:
 
 
 def test_capture_on_legal_take() -> None:
-    fen = 'rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2'
-    assert infer_captured_piece(fen, 'e4', 'e5') == 'p'
+    fen = 'rnbqkbnr/ppp1pppp/8/3p4/4P3/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 2'
+    assert infer_captured_piece(fen, 'e4', 'd5') == 'p'

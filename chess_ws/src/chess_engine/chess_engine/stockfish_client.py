@@ -86,6 +86,8 @@ class StockfishClient:
 
     def choose_move(self, fen: str) -> str:
         board = chess.Board(fen)
+        if board.is_game_over():
+            raise RuntimeError('game is over; no legal moves')
         preset = DIFFICULTY_PRESETS[self._difficulty]
         depth = int(preset['depth'])
         try:

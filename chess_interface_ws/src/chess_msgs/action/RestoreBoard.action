@@ -1,0 +1,7 @@
+# Restore physical board + graveyard to starting position.
+---
+bool success
+string message
+---
+uint8 progress
+string status

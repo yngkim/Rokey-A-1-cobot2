@@ -134,6 +134,24 @@ home_joints: [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17]
 
 미리보기는 **원본 카메라 영상**에 YOLO bbox 4코너를 homography로 **역투영**해 그립니다. 코너 캘리브가 맞지 않으면 박스가 기물과 어긋납니다.
 
+### 체스 규칙 지원
+
+- **게임 종료**: 체크메이트, 스테일메이트, 기물 부족·50수·3회 반복 등 무승부 → UI `game_phase: finished` 배너
+- **앙파상 / 캐슬링**: 비전 매칭 + 로봇 다단계 pick-place (킹 이동 후 룩, 앙파상 피해 폰 graveyard)
+- **폰 승격**: FEN/UI는 Q/R/B/N 반영 (기본 퀸). **물리 기물은 폰 유지** — `promotion_notice`로 안내
+- **불법 수**: 합법 UCI로 resolve 실패 시 `success=false`, FEN·봇 수 진행 안 함
+
+### 게임 상태 저장 (SQLite)
+
+진행 중 게임은 `~/.chess/games.db`에 자동 저장됩니다.
+
+- **저장 항목**: FEN, 차례, 수 히스토리, 잡은 기물, graveyard 16슬롯, 게임 단계, 봇 상태
+- **복원**: `web_bridge` 시작 후 약 4초 뒤 마지막 active 게임을 vision·로봇에 동기화
+- **보드 정정**: `POST /api/board/correct` — FEN만 맞추고 **수 히스토리는 유지**, `bot_status` 오류 해제
+- **새 게임**: `POST /api/reset` — DB에 새 게임 row 생성
+
+파라미터: `game_db_path` (기본 `~/.chess/games.db`), `restore_saved_game` (기본 `true`)
+
 ### API
 
 - `GET /api/board` — FEN + occupancy + 차례/봇 상태
@@ -142,6 +160,7 @@ home_joints: [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17]
 - `GET /api/camera/preview.jpg` — 최신 프레임 JPEG 스냅샷
 - `POST /api/reset` — 리셋 + 초기 스캔 (+ 로봇 선수 시 자동 첫 수)
 - `POST /api/player-moved` — 사용자 수 감지 (비전 스캔)
+- `POST /api/board/correct` — FEN 수동 정정 (히스토리 유지)
 - `POST /api/move` — 로봇 pick-place (`{"from":"e2","to":"e4"}`) — 디버그용
 
 ## 수동 pick-place만 (비전 없음)

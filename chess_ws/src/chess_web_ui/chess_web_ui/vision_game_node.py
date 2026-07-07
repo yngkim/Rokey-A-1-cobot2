@@ -7,7 +7,14 @@ import threading
 
 import rclpy
 from chess_msgs.msg import BoardOccupancy, BoardState, GameSnapshot
-from chess_msgs.srv import ApplyRobotMove, ConfirmPlayerMove, MoveToObserve, ScanBoard, ScanInitial
+from chess_msgs.srv import (
+    ApplyRobotMove,
+    ConfirmPlayerMove,
+    MoveToObserve,
+    ScanBoard,
+    ScanInitial,
+    SetBoard,
+)
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -16,12 +23,28 @@ from std_msgs.msg import Header
 from chess_web_ui.vision_session import VisionSession
 
 
+def _confidence_list(raw) -> list[float] | None:
+    if raw is None:
+        return None
+    try:
+        values = list(raw)
+    except TypeError:
+        return None
+    return values if values else None
+
+
 class VisionGameNode(Node):
     def __init__(self) -> None:
         super().__init__('vision_game_node')
         self.declare_parameter('auto_detect_moves', False)
         self.declare_parameter('auto_detect_stable_frames', 4)
+        self.declare_parameter('depth_empty_square_min_conf', 0.42)
+        self.declare_parameter('fen_snap_baseline', True)
         self.session = VisionSession()
+        self.session.configure_depth_filter(
+            empty_square_min_conf=float(self.get_parameter('depth_empty_square_min_conf').value),
+            fen_snap_baseline=bool(self.get_parameter('fen_snap_baseline').value),
+        )
         self._busy = False
         self._live_cells: list[bool] | None = None
         self._live_stable = 0
@@ -44,6 +67,12 @@ class VisionGameNode(Node):
             ApplyRobotMove,
             'chess/apply_robot_move',
             self.handle_apply_robot_move,
+            callback_group=group,
+        )
+        self.create_service(
+            SetBoard,
+            'chess/set_board',
+            self.handle_set_board,
             callback_group=group,
         )
 
@@ -75,14 +104,14 @@ class VisionGameNode(Node):
             response.board_state = self._make_board_state(valid=False, message=response.message)
             return response
 
-        cells, scan_msg = self._scan_board()
+        cells, confidence, scan_msg = self._scan_board()
         if cells is None:
             response.success = False
             response.message = scan_msg or 'vision scan failed'
             response.board_state = self._make_board_state(valid=False, message=response.message)
             return response
 
-        outcome = self.session.apply_initial_scan(cells)
+        outcome = self.session.apply_initial_scan(cells, confidence=confidence)
         self._publish_state(outcome.message, cells=cells, valid=True)
         response.success = outcome.success
         response.message = outcome.message if outcome.success else f'{outcome.message}; {scan_msg}'
@@ -95,29 +124,54 @@ class VisionGameNode(Node):
         return response
 
     def handle_confirm_player_move(self, request, response):
-        del request
+        promo = (getattr(request, 'promotion_piece', '') or '').strip().lower()
+        from_sq = (getattr(request, 'from_square', '') or '').strip().lower()
+        to_sq = (getattr(request, 'to_square', '') or '').strip().lower()
+
+        if promo and from_sq and to_sq:
+            outcome = self.session.apply_player_promotion(from_sq, to_sq, promo)
+            cells = outcome.cells if outcome.cells is not None else self.session.previous_cells
+            self._publish_state(outcome.message, cells=cells, valid=outcome.success)
+            response.success = outcome.success
+            response.message = outcome.message
+            response.from_square = outcome.from_square
+            response.to_square = outcome.to_square
+            response.uci = outcome.uci
+            response.promotion_piece = outcome.promotion_piece
+            response.fen = outcome.fen or self.session.game.fen
+            response.promotion_required = False
+            response.board_state = self._make_board_state(
+                valid=outcome.success,
+                message=outcome.message,
+                cells=cells,
+            )
+            return response
+
         if self._busy:
             response.success = False
             response.message = 'scan already in progress'
             response.board_state = self._make_board_state(valid=False, message=response.message)
             return response
 
-        cells, scan_msg = self._scan_board()
+        cells, confidence, scan_msg = self._scan_board()
         if cells is None:
             response.success = False
             response.message = scan_msg or 'vision scan failed'
             response.board_state = self._make_board_state(valid=False, message=response.message)
             return response
 
-        outcome = self.session.apply_player_move_scan(cells)
+        outcome = self.session.apply_player_move_scan(cells, confidence=confidence)
         msg = outcome.message if outcome.success else f'{outcome.message}; {scan_msg}'
         self._publish_state(msg, cells=cells, valid=outcome.success)
         response.success = outcome.success
         response.message = msg
         response.from_square = outcome.from_square
         response.to_square = outcome.to_square
+        response.uci = outcome.uci
+        response.promotion_piece = outcome.promotion_piece
         response.captured_piece = outcome.captured_piece
         response.fen = outcome.fen or self.session.game.fen
+        response.promotion_required = bool(getattr(outcome, 'promotion_required', False))
         response.board_state = self._make_board_state(
             valid=outcome.success,
             message=msg,
@@ -132,6 +186,7 @@ class VisionGameNode(Node):
             return
 
         cells = list(msg.occupancy.cells)
+        confidence = _confidence_list(msg.occupancy.confidence)
         baseline = self.session.baseline_cells()
         if cells == baseline:
             self._live_stable = 0
@@ -148,7 +203,7 @@ class VisionGameNode(Node):
         if self._live_stable < need:
             return
 
-        outcome = self.session.apply_player_move_scan(cells)
+        outcome = self.session.apply_player_move_scan(cells, confidence=confidence)
         self._live_stable = 0
         self._live_cells = None
         if not outcome.success:
@@ -158,6 +213,28 @@ class VisionGameNode(Node):
         self.get_logger().info(
             f'auto-detected move {outcome.from_square} -> {outcome.to_square}'
         )
+
+    def handle_set_board(self, request, response):
+        fen = (request.fen or '').strip()
+        if not fen:
+            response.success = False
+            response.message = 'empty FEN'
+            response.fen = self.session.game.fen
+            response.board_state = self._make_board_state(valid=False, message=response.message)
+            return response
+
+        outcome = self.session.set_board_from_fen(fen)
+        cells = outcome.cells if outcome.cells is not None else self.session.previous_cells
+        self._publish_state(outcome.message, cells=cells, valid=outcome.success)
+        response.success = outcome.success
+        response.message = outcome.message
+        response.fen = self.session.game.fen
+        response.board_state = self._make_board_state(
+            valid=outcome.success,
+            message=outcome.message,
+            cells=cells,
+        )
+        return response
 
     def handle_apply_robot_move(self, request, response):
         move = request.move
@@ -170,6 +247,7 @@ class VisionGameNode(Node):
             int(move.from_square.row),
             int(move.to_square.col),
             int(move.to_square.row),
+            promotion=move.promotion,
         )
         cells = outcome.cells if outcome.cells is not None else self.session.previous_cells
         self._publish_state(outcome.message, cells=cells, valid=outcome.success)
@@ -200,7 +278,7 @@ class VisionGameNode(Node):
             return None
         return future.result()
 
-    def _scan_board(self) -> tuple[list[bool] | None, str]:
+    def _scan_board(self) -> tuple[list[bool] | None, list[float] | None, str]:
         self._busy = True
         try:
             self._call_observe_pose()
@@ -208,7 +286,7 @@ class VisionGameNode(Node):
                 msg = 'vision/scan_board unavailable'
                 self.get_logger().error(msg)
                 self._publish_state(msg, cells=None, valid=False)
-                return None, msg
+                return None, None, msg
 
             future = self.scan_client.call_async(ScanBoard.Request())
             result = self._wait_future(future, timeout_sec=30.0)
@@ -216,15 +294,16 @@ class VisionGameNode(Node):
                 msg = 'scan_board call timed out'
                 self.get_logger().error(msg)
                 self._publish_state(msg, cells=None, valid=False)
-                return None, msg
+                return None, None, msg
             cells = list(result.board_state.occupancy.cells)
+            confidence = _confidence_list(result.board_state.occupancy.confidence)
             if not result.success or not result.board_state.valid:
                 msg = result.message or 'scan failed'
                 self.get_logger().error(f'scan failed: {msg}')
                 self._publish_state(msg, cells=cells, valid=False)
-                return None, msg
+                return None, None, msg
 
-            return cells, result.message
+            return cells, confidence, result.message
         finally:
             self._busy = False
 

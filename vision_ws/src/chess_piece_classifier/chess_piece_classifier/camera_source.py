@@ -166,12 +166,16 @@ class RealSenseBuffer:
 
         last_frame = None
         stable = 0
+        depth_frames: list[np.ndarray] = []
         deadline = time.time() + 5.0
         while stable < frame_count and time.time() < deadline:
             frame = self.get_frame()
+            depth = self.get_depth_frame()
             if frame is None:
                 self._spin()
                 continue
+            if depth is not None:
+                depth_frames.append(depth.astype(np.float32))
             if last_frame is not None and frame.shape == last_frame.shape:
                 diff = np.mean(cv2.absdiff(frame, last_frame))
                 if diff < 2.0:
@@ -183,7 +187,19 @@ class RealSenseBuffer:
 
         if last_frame is None:
             return None, None
-        return last_frame, self.get_depth_frame()
+        depth_out = self._median_depth_frames(depth_frames)
+        return last_frame, depth_out
+
+    @staticmethod
+    def _median_depth_frames(frames: list[np.ndarray]) -> np.ndarray | None:
+        if not frames:
+            return None
+        if len(frames) == 1:
+            return frames[0]
+        stack = np.stack(frames, axis=0)
+        stack = np.where(stack > 0.0, stack, np.nan)
+        merged = np.nanmedian(stack, axis=0)
+        return np.nan_to_num(merged, nan=0.0).astype(np.float32)
 
     def destroy(self) -> None:
         self._img_node.destroy_node()

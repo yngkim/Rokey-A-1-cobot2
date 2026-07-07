@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import time
 
+import chess
 import rclpy
-from chess_msgs.action import ExecuteMove
+from chess_msgs.action import ExecuteMove, RestoreBoard
 from chess_msgs.msg import BoardOccupancy, BoardState, GameSnapshot
-from chess_msgs.srv import MoveToObserve, ResetBoard, RetreatArm
+from chess_msgs.srv import MoveToObserve, ResetBoard, RetreatArm, SetBoard
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -16,7 +17,10 @@ from rclpy.node import Node
 from std_msgs.msg import Header
 
 from chess_robot_motion.board_state_manager import BoardStateManager
-from chess_robot_motion.square_pose_map import SquareCoord
+from chess_robot_motion.graveyard_pose_map import graveyard_slot_name
+from chess_robot_motion.graveyard_state import GraveyardState
+from chess_robot_motion.move_physics import captured_piece_symbol
+from chess_pick_place.restore_board import apply_restore_move_to_state, board_needs_restore, plan_board_restore
 
 
 class FakeRobotNode(Node):
@@ -24,13 +28,20 @@ class FakeRobotNode(Node):
         super().__init__('fake_robot_node')
         self.declare_parameter('publish_board_state', True)
         self.declare_parameter('home_joints', [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17])
-        self.declare_parameter('discard_joints', [-1.33, -24.77, 109.43, -0.02, 95.34, -1.07])
+        self.declare_parameter('robot_color', 'black')
+        self.declare_parameter('graveyard_enabled', True)
+        self.declare_parameter('graveyard_a0_joints', [19.87, 41.8, 56.67, -0.03, 81.53, 19.86])
+        self.declare_parameter('white_graveyard_col_step_mm', 40.0)
+        self.declare_parameter('white_graveyard_row_step_mm', -40.0)
         self.board = BoardStateManager()
+        self.robot_graveyard = GraveyardState(side=self._robot_color())
+        self.human_graveyard = GraveyardState(side=self._human_graveyard_side())
         self.board_pub = self.create_publisher(BoardState, 'chess/board_state', 10)
         self.snapshot_pub = self.create_publisher(GameSnapshot, 'chess/game_snapshot', 10)
 
         group = ReentrantCallbackGroup()
         self.create_service(ResetBoard, 'chess/reset_board', self.handle_reset, callback_group=group)
+        self.create_service(SetBoard, 'robot/set_board', self.handle_set_board, callback_group=group)
         self.create_service(MoveToObserve, 'robot/move_to_observe', self.handle_observe, callback_group=group)
         self.create_service(RetreatArm, 'robot/retreat_arm', self.handle_retreat, callback_group=group)
         self._action_server = ActionServer(
@@ -38,6 +49,15 @@ class FakeRobotNode(Node):
             ExecuteMove,
             'robot/execute_move',
             execute_callback=self.execute_move,
+            goal_callback=self.goal_callback,
+            cancel_callback=self.cancel_callback,
+            callback_group=group,
+        )
+        self._restore_action_server = ActionServer(
+            self,
+            RestoreBoard,
+            'robot/restore_board',
+            execute_callback=self.execute_restore_board,
             goal_callback=self.goal_callback,
             cancel_callback=self.cancel_callback,
             callback_group=group,
@@ -74,12 +94,66 @@ class FakeRobotNode(Node):
         snapshot.game_id = 'manual_test'
         self.snapshot_pub.publish(snapshot)
 
+    def _graveyard_enabled(self) -> bool:
+        return bool(self.get_parameter('graveyard_enabled').value)
+
+    def _robot_color(self) -> str:
+        return str(self.get_parameter('robot_color').value).strip().lower()
+
+    def _use_graveyard_for_capture(self, captured_symbol: str | None) -> bool:
+        del captured_symbol
+        return self._graveyard_enabled()
+
+    def _resolve_captured_symbol(self, captured_symbol: str | None) -> str:
+        if captured_symbol:
+            return captured_symbol
+        return 'p' if self._robot_color() == 'white' else 'P'
+
+    def _human_graveyard_side(self) -> str:
+        return 'white' if self._robot_color() == 'black' else 'black'
+
+    def _place_captured_in_graveyard_stub(self, captured_symbol: str) -> None:
+        if self.robot_graveyard.is_full():
+            raise RuntimeError('graveyard full (16 slots occupied)')
+        slot = self.robot_graveyard.next_empty_slot()
+        if slot is None:
+            raise RuntimeError('graveyard full (no empty slot)')
+        grave_col, grave_row = slot
+        slot_name = graveyard_slot_name(grave_col, grave_row, side=self._robot_color())
+        self.get_logger().info(f'graveyard place {slot_name} ({captured_symbol}) (stub)')
+        self.robot_graveyard.place_piece(grave_col, grave_row, captured_symbol)
+        self.get_logger().info(f'graveyard state: {self.robot_graveyard.summary()}')
+
     def handle_reset(self, request, response):
         del request
         self.board.reset()
+        self.robot_graveyard.reset()
+        self.human_graveyard.reset()
         self._publish_board_state('board reset')
         response.success = True
         response.message = 'board reset'
+        return response
+
+    def handle_set_board(self, request, response):
+        fen = request.fen.strip()
+        if not fen:
+            response.success = False
+            response.message = 'empty FEN'
+            return response
+        try:
+            self.board.set_fen(fen)
+            graveyard_json = getattr(request, 'graveyard_slots_json', '') or ''
+            if graveyard_json.strip():
+                self.robot_graveyard.load_slots(GraveyardState.slots_from_json(graveyard_json))
+            human_gy_json = getattr(request, 'human_graveyard_slots_json', '') or ''
+            if human_gy_json.strip():
+                self.human_graveyard.load_slots(GraveyardState.slots_from_json(human_gy_json))
+            response.success = True
+            response.message = 'robot board synced from FEN'
+            response.fen = self.board.fen
+        except Exception as exc:  # noqa: BLE001
+            response.success = False
+            response.message = str(exc)
         return response
 
     def handle_observe(self, request, response):
@@ -111,11 +185,11 @@ class FakeRobotNode(Node):
         from_row = int(move.from_square.row)
         to_col = int(move.to_square.col)
         to_row = int(move.to_square.row)
+        from_name = f'{chr(ord("a") + from_col)}{from_row + 1}'
+        to_name = f'{chr(ord("a") + to_col)}{to_row + 1}'
+        raw_uci = f'{from_name}{to_name}{move.promotion or ""}'
 
-        validation = self.board.validate_move(
-            SquareCoord(col=from_col, row=from_row),
-            SquareCoord(col=to_col, row=to_row),
-        )
+        validation = self.board.validate_uci(raw_uci)
         if not validation.ok:
             goal_handle.abort()
             result = ExecuteMove.Result()
@@ -123,21 +197,35 @@ class FakeRobotNode(Node):
             result.message = validation.message
             return result
 
-        is_capture = bool(move.is_capture) or validation.is_capture
-        if is_capture:
-            self.get_logger().info(
-                f'Capture: remove piece at ({to_col},{to_row}), discard, then move '
-                f'({from_col},{from_row}) -> ({to_col},{to_row}) (stub)'
-            )
-            discard = list(self.get_parameter('discard_joints').value)
-            self.get_logger().info(f'movej discard (stub): {discard}')
+        is_capture = validation.is_capture
+        is_en_passant = validation.is_en_passant or bool(move.is_en_passant)
+
+        if is_capture and not is_en_passant:
+            board = chess.Board(self.board.fen)
+            captured_move = chess.Move.from_uci(validation.full_uci)
+            symbol = captured_piece_symbol(board, captured_move)
+            if not self._use_graveyard_for_capture(symbol):
+                goal_handle.abort()
+                result = ExecuteMove.Result()
+                result.success = False
+                result.message = 'graveyard disabled; cannot capture piece'
+                return result
+            if symbol:
+                self._place_captured_in_graveyard_stub(symbol)
+
+        if is_en_passant:
+            board = chess.Board(self.board.fen)
+            captured_move = chess.Move.from_uci(validation.full_uci)
+            symbol = captured_piece_symbol(board, captured_move)
+            if symbol:
+                self._place_captured_in_graveyard_stub(symbol)
 
         self.get_logger().info(
             f'Executing move ({from_col},{from_row}) -> ({to_col},{to_row}) (stub)'
         )
 
         feedback = ExecuteMove.Feedback()
-        progress_steps = (10, 25, 50, 75, 100) if is_capture else (25, 50, 75, 100)
+        progress_steps = (10, 25, 50, 75, 100) if is_capture and not is_en_passant else (25, 50, 75, 100)
         for progress in progress_steps:
             if goal_handle.is_cancel_requested:
                 goal_handle.canceled()
@@ -146,20 +234,11 @@ class FakeRobotNode(Node):
                 result.message = 'canceled'
                 return result
             feedback.progress = progress
-            status = 'moving'
-            if is_capture:
-                if progress <= 10:
-                    status = 'removing captured piece'
-                elif progress <= 25:
-                    status = 'discarding captured piece'
-            feedback.status = status
+            feedback.status = 'moving'
             goal_handle.publish_feedback(feedback)
             time.sleep(0.1)
 
-        self.board.apply_move(
-            SquareCoord(col=from_col, row=from_row),
-            SquareCoord(col=to_col, row=to_row),
-        )
+        self.board.apply_uci(validation.full_uci)
         self._publish_board_state('move completed (stub)')
 
         goal_handle.succeed()
@@ -167,6 +246,60 @@ class FakeRobotNode(Node):
         result.success = True
         result.message = 'move completed'
         return result
+
+    def execute_restore_board(self, goal_handle):
+        feedback = RestoreBoard.Feedback()
+        result = RestoreBoard.Result()
+        try:
+            if not board_needs_restore(self.board, self.robot_graveyard, self.human_graveyard):
+                result.success = True
+                result.message = 'already at starting position'
+                goal_handle.succeed()
+                return result
+
+            moves = plan_board_restore(self.board, self.robot_graveyard, self.human_graveyard)
+            total = len(moves)
+            self.get_logger().info(f'restore board (stub): {total} planned moves')
+
+            for index, move in enumerate(moves):
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    result.success = False
+                    result.message = 'canceled'
+                    return result
+                feedback.progress = int((index / max(total, 1)) * 90)
+                feedback.status = f'{move.kind} {move.symbol} (stub)'
+                goal_handle.publish_feedback(feedback)
+                self.get_logger().info(
+                    f'restore {index + 1}/{total}: {move.kind} {move.symbol} (stub)'
+                )
+                apply_restore_move_to_state(
+                    self.board,
+                    self.robot_graveyard,
+                    move,
+                    human_graveyard=self.human_graveyard,
+                )
+                time.sleep(0.05)
+
+            self.board.reset()
+            self.robot_graveyard.reset()
+            self.human_graveyard.reset()
+            self._publish_board_state('board restored (stub)')
+
+            feedback.progress = 100
+            feedback.status = 'done'
+            goal_handle.publish_feedback(feedback)
+
+            result.success = True
+            result.message = f'board restored ({total} moves, stub)'
+            goal_handle.succeed()
+            return result
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'restore board failed: {exc}')
+            goal_handle.abort()
+            result.success = False
+            result.message = str(exc)
+            return result
 
 
 def main(args=None) -> None:

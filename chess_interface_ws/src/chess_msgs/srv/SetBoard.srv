@@ -1,0 +1,11 @@
+# Manually set the logical board FEN (web UI correction).
+string fen
+# Optional JSON array (length 16) of captured piece symbols for robot graveyard sync.
+string graveyard_slots_json
+# Optional JSON array (length 16) for human/opponent graveyard sync.
+string human_graveyard_slots_json
+---
+bool success
+string message
+string fen
+BoardState board_state

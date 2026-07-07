@@ -11,8 +11,10 @@ def cell_medians_from_warped_depth(
     warped_depth: np.ndarray,
     warp_size: int,
     margin_ratio: float = 0.22,
+    percentile: float = 50.0,
+    min_valid_pixels: int = 4,
 ) -> np.ndarray:
-    """Return 8x8 median depth (mm) per cell; NaN where too few valid pixels."""
+    """Return 8x8 depth statistic (mm) per cell; NaN where too few valid pixels."""
     cell_px = warp_size / 8.0
     medians = np.full((8, 8), np.nan, dtype=np.float32)
 
@@ -27,9 +29,14 @@ def cell_medians_from_warped_depth(
                 continue
             valid = patch.astype(np.float32)
             valid = valid[valid > 0.0]
-            if valid.size < 8:
+            if valid.size < min_valid_pixels:
                 continue
-            medians[row, col] = float(np.median(valid))
+            if percentile <= 0.0:
+                medians[row, col] = float(np.min(valid))
+            elif percentile >= 100.0:
+                medians[row, col] = float(np.max(valid))
+            else:
+                medians[row, col] = float(np.percentile(valid, percentile))
 
     return medians
 

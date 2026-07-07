@@ -2,6 +2,8 @@
 
 import chess
 
+from chess_game.board_utils import occupancy_from_fen
+from chess_game.game_state import GameState
 from chess_web_ui.vision_session import VisionSession
 
 
@@ -56,7 +58,12 @@ def test_detect_d7d5_when_d7_still_reads_occupied() -> None:
     before = _starting_cells()
     session.apply_initial_scan(before)
 
-    after = list(before)
+    after_white = list(before)
+    after_white[12] = False
+    after_white[28] = True
+    session.apply_player_move_scan(after_white)
+
+    after = list(session.previous_cells or after_white)
     after[35] = True  # d5
     outcome = session.apply_player_move_scan(after)
     assert outcome.success
@@ -104,3 +111,86 @@ def test_apply_robot_move_updates_occupancy() -> None:
     assert session.previous_cells is not None
     assert session.previous_cells[52] is False
     assert session.previous_cells[36] is True
+
+
+def test_set_board_from_fen_syncs_occupancy() -> None:
+    from chess_game.board_utils import occupancy_from_fen
+
+    session = VisionSession()
+    session.apply_initial_scan(_starting_cells())
+
+    custom_fen = 'rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2'
+    outcome = session.set_board_from_fen(custom_fen)
+    assert outcome.success
+    assert session.game.fen == custom_fen
+    assert session.previous_cells == occupancy_from_fen(custom_fen)
+
+
+def test_false_positive_on_empty_square_ignored_with_low_confidence() -> None:
+    session = VisionSession()
+    session.apply_initial_scan(_starting_cells())
+
+    after = list(_starting_cells())
+    after[12] = False  # e2
+    after[28] = True   # e4
+    after[27] = True   # d4 noise
+    confidence = [0.8 if occupied else 0.0 for occupied in after]
+    confidence[28] = 0.8
+    confidence[27] = 0.1
+
+    outcome = session.apply_player_move_scan(after, confidence=confidence)
+    assert outcome.success
+    assert outcome.from_square == 'e2'
+    assert outcome.to_square == 'e4'
+    assert session.previous_cells == occupancy_from_fen(outcome.fen)
+
+
+def test_fen_snap_baseline_after_move() -> None:
+    session = VisionSession()
+    session.apply_initial_scan(_starting_cells())
+
+    after = list(_starting_cells())
+    after[12] = False
+    after[28] = True
+    session.apply_player_move_scan(after)
+
+    assert session.previous_cells == occupancy_from_fen(session.game.fen)
+
+
+def test_illegal_move_rejected() -> None:
+    session = VisionSession()
+    before = _starting_cells()
+    session.apply_initial_scan(before)
+    fen_before = session.game.fen
+
+    after = list(before)
+    after[12] = False  # e2
+    after[26] = True   # c4 (illegal pawn move)
+    outcome = session.apply_player_move_scan(after)
+    assert not outcome.success
+    assert session.game.fen == fen_before
+
+
+def test_promotion_requires_ui_choice() -> None:
+    session = VisionSession()
+    fen = '8/4P3/8/8/8/8/8/4K2k w - - 0 1'
+    session.game = GameState(fen)
+    session.previous_cells = occupancy_from_fen(fen)
+
+    after = occupancy_from_fen(fen)
+    after[chess.square_file(chess.E7) + chess.square_rank(chess.E7) * 8] = False
+    after[chess.square_file(chess.E8) + chess.square_rank(chess.E8) * 8] = True
+    outcome = session.apply_player_move_scan(after)
+    assert not outcome.success
+    assert outcome.promotion_required
+    assert outcome.message == 'promotion_required'
+    assert session.game.fen == fen
+
+    promoted = session.apply_player_promotion('e7', 'e8', 'q')
+    assert promoted.success
+    board = chess.Board(promoted.fen)
+    piece = board.piece_at(chess.E8)
+    assert piece is not None
+    assert piece.piece_type == chess.QUEEN
+    assert promoted.promotion_piece == 'q'
+

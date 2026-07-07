@@ -47,8 +47,9 @@ class OccupancyNode(Node):
         self.declare_parameter('board_flip_files', True)
         self.declare_parameter('depth_occupancy_enabled', True)
         self.declare_parameter('empty_depth_reference_path', '')
-        self.declare_parameter('depth_occupancy_threshold_mm', 4.0)
-        self.declare_parameter('depth_occupancy_min_conf', 0.30)
+        self.declare_parameter('depth_occupancy_threshold_mm', 2.9)
+        self.declare_parameter('depth_occupancy_min_conf', 0.18)
+        self.declare_parameter('depth_cell_percentile', 30.0)
         self.declare_parameter(
             'board_manual_corners',
             [0, 0, 0, 0, 0, 0, 0, 0],
@@ -260,6 +261,7 @@ class OccupancyNode(Node):
             'empty_depth_reference': self._empty_depth_reference,
             'depth_threshold_mm': float(self.get_parameter('depth_occupancy_threshold_mm').value),
             'depth_min_conf': float(self.get_parameter('depth_occupancy_min_conf').value),
+            'depth_cell_percentile': float(self.get_parameter('depth_cell_percentile').value),
             'yolo_enabled': bool(self.get_parameter('yolo_enabled').value),
         }
 
@@ -338,7 +340,7 @@ class OccupancyNode(Node):
                 return response
         else:
             cells = scan_result.cells
-            confidence = scan_result.confidence
+            confidence = list(scan_result.confidence)
             message = scan_result.message
             valid = True
             success = True

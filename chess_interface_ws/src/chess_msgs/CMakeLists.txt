@@ -24,7 +24,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ScanInitial.srv"
   "srv/ConfirmPlayerMove.srv"
   "srv/ApplyRobotMove.srv"
+  "srv/SetBoard.srv"
   "action/ExecuteMove.action"
+  "action/RestoreBoard.action"
   DEPENDENCIES std_msgs action_msgs
 )
 

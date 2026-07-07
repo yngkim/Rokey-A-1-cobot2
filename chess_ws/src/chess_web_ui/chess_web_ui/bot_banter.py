@@ -91,6 +91,23 @@ def react_to_player_move(
     return random.choice(lines)
 
 
+def react_to_game_over(
+    difficulty: Difficulty,
+    *,
+    result: str,
+    winner: str,
+) -> str:
+    del difficulty
+    if result == 'checkmate':
+        if winner == 'human':
+            return '체크메이트! 이번 판은 당신 승리입니다.'
+        if winner == 'robot':
+            return '체크메이트. 이번 판은 내 승리다.'
+    if result == 'stalemate':
+        return '스테일메이트. 무승부입니다.'
+    return '무승부로 게임이 끝났습니다.'
+
+
 def react_to_bot_move(difficulty: Difficulty, *, is_capture: bool, is_check: bool) -> str:
     base = random.choice(_BOT_MOVE_LINES[difficulty])
     if is_check and difficulty != 'hard':

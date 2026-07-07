@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from typing import Any, Literal
@@ -13,17 +14,33 @@ import cv2
 import rclpy
 import uvicorn
 from chess_game.board_utils import occupancy_from_fen
+from chess_game.move_resolve import (
+    captured_piece_symbol,
+    game_outcome,
+    move_physics_flags,
+    promotion_notice,
+    promotion_piece_char,
+    resolve_legal_uci_full,
+)
 from chess_engine.stockfish_client import StockfishClient
 from chess_web_ui.bot_banter import (
     Difficulty,
     get_bot_profile,
     greeting,
     react_to_bot_move,
+    react_to_game_over,
     react_to_player_move,
 )
-from chess_msgs.action import ExecuteMove
-from chess_msgs.msg import BoardState, ChessMove, GameSnapshot
-from chess_msgs.srv import ApplyRobotMove, ConfirmPlayerMove, ResetBoard, ScanInitial
+from chess_web_ui.game_store import START_FEN, GameRecord, GameStore
+from chess_web_ui.graveyard_reconcile import reconcile_graveyards_with_fen
+from chess_web_ui.graveyard_utils import (
+    human_graveyard_side,
+    place_in_graveyard,
+    robot_graveyard_side,
+)
+from chess_msgs.action import ExecuteMove, RestoreBoard
+from chess_msgs.msg import BoardState, ChessMove, GameSnapshot, Square
+from chess_msgs.srv import ApplyRobotMove, ConfirmPlayerMove, ResetBoard, ScanInitial, SetBoard
 from cv_bridge import CvBridge
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +67,16 @@ class GameConfigRequest(BaseModel):
     difficulty: str = 'medium'
 
 
+class BoardCorrectRequest(BaseModel):
+    fen: str
+    graveyard_slots: list[str | None] | None = None
+    human_graveyard_slots: list[str | None] | None = None
+
+
+class PromotionRequest(BaseModel):
+    piece: str
+
+
 class WebBridgeNode(Node):
     def __init__(self) -> None:
         super().__init__('chess_web_bridge')
@@ -63,10 +90,10 @@ class WebBridgeNode(Node):
         self.declare_parameter('human_color', 'white')
         self.declare_parameter('engine_depth', 8)
         self.declare_parameter('difficulty', 'medium')
+        self.declare_parameter('game_db_path', '~/.chess/games.db')
+        self.declare_parameter('restore_saved_game', True)
 
-        self.latest_fen = (
-            'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
-        )
+        self.latest_fen = START_FEN
         self.latest_occupancy = [False] * 64
         self.latest_message = 'Reset을 눌러 초기 스캔을 실행하세요'
         self.latest_from = ''
@@ -81,7 +108,17 @@ class WebBridgeNode(Node):
         self.eval_cp = 0
         self.bot_message = ''
         self.game_phase: Literal['lobby', 'playing', 'finished'] = 'lobby'
+        self.game_result: str = ''
+        self.winner: Literal['human', 'robot', 'draw', ''] = ''
+        self.is_check: bool = False
+        self.promotion_notice: str = ''
         self._ply_counter = 0
+        self.graveyard_slots: list[str | None] = [None] * 16
+        self.human_graveyard_slots: list[str | None] = [None] * 16
+        self._pending_promotion: dict[str, str] | None = None
+        self._active_game_id = ''
+        db_path = str(self.get_parameter('game_db_path').value)
+        self._game_store = GameStore(db_path)
 
         self._preview_lock = threading.Lock()
         self._preview_jpeg: bytes | None = None
@@ -111,10 +148,16 @@ class WebBridgeNode(Node):
         self.scan_initial_client = self.create_client(ScanInitial, 'chess/scan_initial')
         self.confirm_player_client = self.create_client(ConfirmPlayerMove, 'chess/confirm_player_move')
         self.apply_robot_client = self.create_client(ApplyRobotMove, 'chess/apply_robot_move')
+        self.set_board_client = self.create_client(SetBoard, 'chess/set_board')
         self.action_client = ActionClient(self, ExecuteMove, 'robot/execute_move')
+        self.restore_action_client = ActionClient(self, RestoreBoard, 'robot/restore_board')
+        self.robot_set_board_client = self.create_client(SetBoard, 'robot/set_board')
         self.get_logger().info(
-            f'Web bridge ready (human={self._human_color()}, auto_bot={self._auto_bot_move()})'
+            f'Web bridge ready (human={self._human_color()}, auto_bot={self._auto_bot_move()}, '
+            f'db={self._game_store.db_path})'
         )
+        if bool(self.get_parameter('restore_saved_game').value):
+            self._restore_timer = self.create_timer(4.0, self._try_restore_saved_game)
 
     def shutdown(self) -> None:
         self._engine.stop()
@@ -163,12 +206,7 @@ class WebBridgeNode(Node):
             return uci
 
     def _is_legal_uci(self, fen: str, uci: str) -> bool:
-        try:
-            board = chess.Board(fen)
-            move = chess.Move.from_uci(uci)
-            return move in board.legal_moves
-        except (ValueError, AssertionError):
-            return False
+        return resolve_legal_uci_full(uci, fen) is not None
 
     def _with_engine(self, fn):
         with self._engine_lock:
@@ -196,6 +234,136 @@ class WebBridgeNode(Node):
         if quality:
             entry['quality'] = quality
         self.move_history.append(entry)
+        self._persist_game_state()
+
+    def _game_record(self) -> GameRecord:
+        return GameRecord(
+            id=self._active_game_id or 'unsaved',
+            created_at='',
+            updated_at='',
+            is_active=True,
+            fen=self.latest_fen,
+            human_color=self._human_color(),
+            difficulty=self._difficulty(),
+            game_phase=self.game_phase,
+            game_result=self.game_result,
+            winner=self.winner,
+            eval_cp=self.eval_cp,
+            bot_status=self.bot_status,
+            graveyard_slots=list(self.graveyard_slots),
+            human_graveyard_slots=list(self.human_graveyard_slots),
+            human_captures=list(self.human_captures),
+            robot_captures=list(self.robot_captures),
+            move_history=list(self.move_history),
+            ply_counter=self._ply_counter,
+            last_bot_move=self.last_bot_move,
+            bot_message=self.bot_message,
+        )
+
+    def _ensure_active_game(self) -> None:
+        if self._active_game_id:
+            return
+        record = self._game_store.create_new_game(
+            fen=self.latest_fen,
+            human_color=self._human_color(),
+            difficulty=self._difficulty(),
+            game_phase=self.game_phase if self.game_phase != 'lobby' else 'playing',
+            bot_message=self.bot_message,
+        )
+        self._active_game_id = record.id
+        self.graveyard_slots = list(record.graveyard_slots)
+        self.human_graveyard_slots = list(record.human_graveyard_slots)
+
+    def _persist_game_state(self) -> None:
+        if not self._active_game_id:
+            return
+        try:
+            self._game_store.save_game(self._game_record())
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'failed to persist game state: {exc}')
+
+    def _apply_game_record(self, record: GameRecord) -> None:
+        self._active_game_id = record.id
+        self.latest_fen = record.fen
+        self.latest_occupancy = occupancy_from_fen(record.fen)
+        parts = record.fen.split()
+        self.latest_white_to_move = len(parts) > 1 and parts[1] == 'w'
+        self.human_captures = list(record.human_captures)
+        self.robot_captures = list(record.robot_captures)
+        self.move_history = list(record.move_history)
+        self._ply_counter = record.ply_counter
+        self.eval_cp = record.eval_cp
+        self.bot_message = record.bot_message
+        self.game_phase = record.game_phase  # type: ignore[assignment]
+        self.game_result = record.game_result
+        self.winner = record.winner  # type: ignore[assignment]
+        self.bot_status = record.bot_status  # type: ignore[assignment]
+        self.last_bot_move = record.last_bot_move
+        self.graveyard_slots = list(record.graveyard_slots)
+        self.human_graveyard_slots = list(record.human_graveyard_slots)
+        self.is_check = chess.Board(record.fen).is_check()
+        self.promotion_notice = ''
+
+    def _refresh_game_phase(self, fen: str) -> None:
+        outcome = game_outcome(chess.Board(fen))
+        self.is_check = chess.Board(fen).is_check()
+        if outcome.is_over:
+            self._update_game_over_state(fen)
+        else:
+            self.game_phase = 'playing'
+            self.game_result = ''
+            self.winner = ''
+
+    def _sync_logical_board(self, fen: str) -> tuple[bool, str]:
+        if not self._vision_mode():
+            self._sync_from_fen(fen)
+            return True, 'local FEN synced'
+        result, err = self._call_service(
+            self.set_board_client,
+            SetBoard.Request(fen=fen),
+            timeout_sec=10.0,
+        )
+        if result is None:
+            return False, err
+        if not result.success:
+            return False, result.message
+        if result.board_state is not None:
+            self._apply_board_state_msg(result.board_state)
+        if getattr(result, 'fen', ''):
+            self._sync_from_fen(result.fen)
+        else:
+            self._sync_from_fen(fen)
+        return True, result.message
+
+    def _try_restore_saved_game(self) -> None:
+        if hasattr(self, '_restore_timer'):
+            self._restore_timer.cancel()
+        record = self._game_store.load_active_game()
+        if record is None:
+            self.get_logger().info('No saved game to restore')
+            return
+        if record.game_phase == 'lobby':
+            return
+
+        self.get_logger().info(
+            f'Restoring saved game {record.id[:8]}… fen={record.fen.split()[0]} '
+            f'moves={len(record.move_history)}'
+        )
+        self._apply_game_record(record)
+        with self._bot_lock:
+            self._bot_busy = False
+            self._bot_pending_fen = ''
+
+        logical_ok, logical_msg = self._sync_logical_board(record.fen)
+        if not logical_ok:
+            self.get_logger().warn(f'vision restore failed: {logical_msg}')
+        sync_ok, sync_msg = self._sync_robot_board(record.fen)
+        if not sync_ok:
+            self.get_logger().warn(f'robot restore failed: {sync_msg}')
+        self._refresh_game_phase(record.fen)
+        self.latest_message = '저장된 게임을 복원했습니다'
+        self._spin_for_updates()
+        self._persist_game_state()
 
     def set_game_config(self, human_color: str, difficulty: str | None = None) -> None:
         color = human_color.strip().lower()
@@ -224,6 +392,8 @@ class WebBridgeNode(Node):
         self.latest_move_number = int(msg.move_number)
 
     def _maybe_play_bot_move(self, fen: str) -> None:
+        if self.game_phase == 'finished':
+            return
         if not fen or not self._auto_bot_move():
             return
         parts = fen.split()
@@ -261,7 +431,7 @@ class WebBridgeNode(Node):
 
             self.bot_status = 'moving'
             self.latest_message = f'로봇 이동 중: {from_sq} → {to_sq}'
-            success, message = self.execute_bot_move(from_sq, to_sq, fen=fen)
+            success, message = self.execute_bot_move(uci, fen=fen)
             if success:
                 self.bot_status = 'idle'
             else:
@@ -326,32 +496,111 @@ class WebBridgeNode(Node):
         with self._preview_lock:
             return self._preview_jpeg
 
+    def _fill_chess_move(self, msg: ChessMove, fen: str, uci: str) -> str:
+        legal = resolve_legal_uci_full(uci, fen)
+        if legal is None:
+            raise ValueError(f'illegal move {uci!r}')
+        board = chess.Board(fen)
+        move = chess.Move.from_uci(legal)
+        flags = move_physics_flags(board, move)
+
+        msg.from_square.col = chess.square_file(move.from_square)
+        msg.from_square.row = chess.square_rank(move.from_square)
+        msg.to_square.col = chess.square_file(move.to_square)
+        msg.to_square.row = chess.square_rank(move.to_square)
+        msg.promotion = str(flags.get('promotion') or '')
+        msg.is_capture = bool(flags['is_capture'])
+        msg.is_en_passant = bool(flags['is_en_passant'])
+        msg.is_castling = bool(flags['is_castling'])
+
+        cap_name = flags.get('capture_square')
+        if isinstance(cap_name, str):
+            cap_sq = chess.parse_square(cap_name)
+            msg.capture_square.col = chess.square_file(cap_sq)
+            msg.capture_square.row = chess.square_rank(cap_sq)
+        else:
+            msg.capture_square = Square(col=255, row=255)
+
+        rook_from = flags.get('rook_from')
+        rook_to = flags.get('rook_to')
+        if isinstance(rook_from, str) and isinstance(rook_to, str):
+            rf = chess.parse_square(rook_from)
+            rt = chess.parse_square(rook_to)
+            msg.rook_from.col = chess.square_file(rf)
+            msg.rook_from.row = chess.square_rank(rf)
+            msg.rook_to.col = chess.square_file(rt)
+            msg.rook_to.row = chess.square_rank(rt)
+        else:
+            msg.rook_from = Square(col=255, row=255)
+            msg.rook_to = Square(col=255, row=255)
+        return legal
+
+    def _update_game_over_state(self, fen: str) -> None:
+        outcome = game_outcome(chess.Board(fen))
+        self.is_check = chess.Board(fen).is_check()
+        if not outcome.is_over:
+            return
+        self.game_phase = 'finished'
+        self.game_result = outcome.reason or 'draw'
+        if outcome.winner_side == 'draw':
+            self.winner = 'draw'
+        elif outcome.winner_side == self._human_color():
+            self.winner = 'human'
+        else:
+            self.winner = 'robot'
+        self.bot_message = react_to_game_over(
+            self._difficulty(),
+            result=self.game_result,
+            winner=self.winner,
+        )
+        self._persist_game_state()
+
+    def _human_won(self) -> bool:
+        return self.winner == 'human'
+
     def _record_capture(
         self,
         fen_before: str,
-        from_uci: str,
-        to_uci: str,
+        uci: str,
         *,
         by_robot: bool,
     ) -> None:
         try:
+            legal = resolve_legal_uci_full(uci, fen_before)
+            if legal is None:
+                return
             board = chess.Board(fen_before)
-            move = chess.Move.from_uci(f'{from_uci}{to_uci}')
-            if not board.is_capture(move):
+            move = chess.Move.from_uci(legal)
+            symbol = captured_piece_symbol(board, move)
+            if not symbol:
                 return
-            captured = board.piece_at(move.to_square)
-            if captured is None:
-                return
+            captured = chess.Piece.from_symbol(symbol)
             human_is_white = self._human_color() == 'white'
             piece_is_white = captured.color == chess.WHITE
             capturer_is_white = not human_is_white if by_robot else human_is_white
             if piece_is_white == capturer_is_white:
                 return
-            symbol = captured.symbol()
             if by_robot:
                 self.robot_captures.append(symbol)
+                try:
+                    self.graveyard_slots = place_in_graveyard(
+                        self.graveyard_slots,
+                        robot_graveyard_side(self._human_color()),
+                        symbol,
+                    )
+                except ValueError:
+                    self.get_logger().warn('robot graveyard full while recording capture')
             else:
                 self.human_captures.append(symbol)
+                try:
+                    self.human_graveyard_slots = place_in_graveyard(
+                        self.human_graveyard_slots,
+                        human_graveyard_side(self._human_color()),
+                        symbol,
+                    )
+                except ValueError:
+                    self.get_logger().warn('human graveyard full while recording capture')
+            self._persist_game_state()
         except ValueError:
             pass
 
@@ -374,6 +623,14 @@ class WebBridgeNode(Node):
             'bot_message': self.bot_message,
             'bot_profile': self._bot_profile_payload(),
             'game_phase': self.game_phase,
+            'game_result': self.game_result,
+            'winner': self.winner,
+            'is_check': self.is_check,
+            'promotion_notice': self.promotion_notice,
+            'game_id': self._active_game_id,
+            'graveyard_slots': list(self.graveyard_slots),
+            'human_graveyard_slots': list(self.human_graveyard_slots),
+            'promotion_required': self._pending_promotion is not None,
         }
         if self.latest_from and self.latest_to:
             payload['from'] = self.latest_from
@@ -398,22 +655,38 @@ class WebBridgeNode(Node):
     def reset_board(self) -> tuple[bool, str]:
         with self._bot_lock:
             self._bot_pending_fen = ''
+            self._bot_busy = False
         self.last_bot_move = ''
         self.bot_status = 'idle'
         self.human_captures = []
         self.robot_captures = []
         self.move_history = []
         self._ply_counter = 0
-        self.eval_cp = self._eval_from_human_perspective(
-            'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
-        )
+        self.graveyard_slots = [None] * 16
+        self.human_graveyard_slots = [None] * 16
+        self._pending_promotion = None
+        self.eval_cp = self._eval_from_human_perspective(START_FEN)
         self.bot_message = greeting(self._difficulty())
         self.game_phase = 'playing'
+        self.game_result = ''
+        self.winner = ''
+        self.is_check = False
+        self.promotion_notice = ''
 
         success, message = self._reset_robot()
         if not success:
             return False, message
         if not self._vision_mode():
+            self._sync_from_fen(START_FEN)
+            record = self._game_store.create_new_game(
+                fen=self.latest_fen,
+                human_color=self._human_color(),
+                difficulty=self._difficulty(),
+                game_phase='playing',
+                bot_message=self.bot_message,
+            )
+            self._active_game_id = record.id
+            self._persist_game_state()
             self._maybe_play_bot_move(self.latest_fen)
             return True, message
 
@@ -428,8 +701,71 @@ class WebBridgeNode(Node):
             self._sync_from_fen(result.fen)
         self.eval_cp = self._eval_from_human_perspective()
         self._spin_for_updates()
+        if self.latest_fen:
+            sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+            if not sync_ok:
+                self.get_logger().warn(f'robot board sync after initial scan failed: {sync_msg}')
+        record = self._game_store.create_new_game(
+            fen=self.latest_fen,
+            human_color=self._human_color(),
+            difficulty=self._difficulty(),
+            game_phase='playing',
+            bot_message=self.bot_message,
+        )
+        self._active_game_id = record.id
+        self.graveyard_slots = list(record.graveyard_slots)
+        self.human_graveyard_slots = list(record.human_graveyard_slots)
+        self._persist_game_state()
         self._maybe_play_bot_move(self.latest_fen)
         return bool(result.success), result.message
+
+    def restore_board_physical(self) -> tuple[bool, str]:
+        if not self.restore_action_client.wait_for_server(timeout_sec=5.0):
+            return False, 'restore_board action unavailable'
+
+        if self.latest_fen.strip():
+            sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+            if not sync_ok:
+                return False, sync_msg
+
+        send_future = self.restore_action_client.send_goal_async(RestoreBoard.Goal())
+        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
+        if not send_future.done() or send_future.result() is None:
+            return False, 'failed to send restore goal'
+
+        goal_handle = send_future.result()
+        if not goal_handle.accepted:
+            return False, 'restore goal rejected'
+
+        result_future = goal_handle.get_result_async()
+        deadline = time.time() + 600.0
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if result_future.done():
+                break
+        if not result_future.done():
+            goal_handle.cancel_goal_async()
+            return False, 'restore timed out'
+
+        result = result_future.result().result
+        if not result.success:
+            return False, result.message
+
+        if self._vision_mode():
+            scan_result, err = self._call_service(
+                self.scan_initial_client,
+                ScanInitial.Request(),
+                timeout_sec=90.0,
+            )
+            if scan_result is None:
+                return False, err
+            if scan_result.board_state is not None:
+                self._apply_board_state_msg(scan_result.board_state)
+            if getattr(scan_result, 'fen', ''):
+                self._sync_from_fen(scan_result.fen)
+            self._spin_for_updates()
+
+        return True, result.message
 
     def _reset_robot(self) -> tuple[bool, str]:
         if not self.reset_client.wait_for_service(timeout_sec=2.0):
@@ -441,79 +777,220 @@ class WebBridgeNode(Node):
         result = future.result()
         return bool(result.success), result.message
 
-    def confirm_player_move(self) -> tuple[bool, str, str, str]:
+    def _sync_robot_board(self, fen: str) -> tuple[bool, str]:
+        """Sync pick_place_node internal FEN/occupancy with the logical game state."""
+        fen = (fen or '').strip()
+        if not fen:
+            return False, 'empty FEN for robot sync'
+        request = SetBoard.Request(fen=fen)
+        request.graveyard_slots_json = json.dumps(self.graveyard_slots)
+        request.human_graveyard_slots_json = json.dumps(self.human_graveyard_slots)
+        result, err = self._call_service(
+            self.robot_set_board_client,
+            request,
+            timeout_sec=10.0,
+        )
+        if result is None:
+            return False, f'robot board sync failed: {err}'
+        if not result.success:
+            return False, f'robot board sync failed: {result.message}'
+        return True, result.message
+
+    def confirm_player_move(
+        self,
+        *,
+        promotion_piece: str = '',
+        from_square: str = '',
+        to_square: str = '',
+    ) -> tuple[bool, str, str, str]:
+        if self.game_phase == 'finished':
+            return False, '게임이 종료되었습니다', '', ''
+
+        if self.bot_status == 'error':
+            self.bot_status = 'idle'
+            with self._bot_lock:
+                self._bot_pending_fen = ''
+
+        fen_before = self.latest_fen
+        request = ConfirmPlayerMove.Request()
+        if promotion_piece:
+            request.promotion_piece = promotion_piece.strip().lower()
+            request.from_square = from_square or (self._pending_promotion or {}).get('from', '')
+            request.to_square = to_square or (self._pending_promotion or {}).get('to', '')
+
         result, err = self._call_service(
             self.confirm_player_client,
-            ConfirmPlayerMove.Request(),
+            request,
             timeout_sec=90.0,
         )
         if result is None:
             return False, err, '', ''
-        fen_before = self.latest_fen
+
+        if getattr(result, 'promotion_required', False) or result.message == 'promotion_required':
+            self._pending_promotion = {
+                'from': result.from_square,
+                'to': result.to_square,
+                'fen_before': fen_before,
+            }
+            self.latest_from = result.from_square
+            self.latest_to = result.to_square
+            self.latest_message = '승격할 기물을 선택하세요'
+            return False, self.latest_message, result.from_square, result.to_square
+
+        self._pending_promotion = None
         self.latest_from = result.from_square
         self.latest_to = result.to_square
-        if result.board_state is not None:
-            self._apply_board_state_msg(result.board_state)
-        if result.success and result.from_square and result.to_square:
-            uci = f'{result.from_square}{result.to_square}'
-            if self._is_legal_uci(fen_before, uci):
-                self._record_capture(
-                    fen_before,
+        uci = getattr(result, 'uci', '') or (
+            f'{result.from_square}{result.to_square}'
+            if result.from_square and result.to_square
+            else ''
+        )
+        legal = bool(uci) and self._is_legal_uci(fen_before, uci)
+        success = bool(result.success) and legal
+
+        if success and uci:
+            self._record_capture(fen_before, uci, by_robot=False)
+            self._process_player_move_feedback(fen_before, uci)
+            promo = getattr(result, 'promotion_piece', '') or ''
+            if promo:
+                self.promotion_notice = promotion_notice(
                     result.from_square,
                     result.to_square,
-                    by_robot=False,
+                    promo,
                 )
-                self._process_player_move_feedback(
-                    fen_before,
-                    result.from_square,
-                    result.to_square,
-                )
-            else:
-                self.get_logger().warn(
-                    f'vision move not legal on board: {uci} (fen={fen_before})'
-                )
-        if getattr(result, 'fen', ''):
+        elif result.success and not legal:
+            self.latest_message = f'불법 수입니다: {uci or "unknown"}'
+            self.get_logger().warn(
+                f'vision move not legal on board: {uci} (fen={fen_before})'
+            )
+
+        if success and getattr(result, 'fen', ''):
             self._sync_from_fen(result.fen)
-        elif result.success:
-            self.eval_cp = self._eval_from_human_perspective()
+        elif success and result.board_state is not None:
+            self._apply_board_state_msg(result.board_state)
+        elif not success and result.board_state is not None:
+            self._apply_board_state_msg(result.board_state)
+
         self._spin_for_updates()
-        if result.success:
-            self._maybe_play_bot_move(self.latest_fen)
+        if success and self.latest_fen:
+            self._ensure_active_game()
+            sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+            if not sync_ok:
+                self.get_logger().warn(
+                    f'robot board sync after player move failed: {sync_msg}'
+                )
+            self._update_game_over_state(self.latest_fen)
+            self.is_check = chess.Board(self.latest_fen).is_check()
+            if self.game_phase != 'finished':
+                self._maybe_play_bot_move(self.latest_fen)
+
+        if success or result.success:
+            self._persist_game_state()
+
+        message = self.latest_message if not success and not legal else result.message
         return (
-            bool(result.success),
-            result.message,
+            success,
+            message,
             result.from_square,
             result.to_square,
         )
 
-    def _process_player_move_feedback(
+    def confirm_player_promotion(self, piece: str) -> tuple[bool, str, str, str]:
+        piece = piece.strip().lower()
+        if piece not in {'q', 'r', 'b', 'n'}:
+            return False, '승격 기물은 q, r, b, n 중 하나여야 합니다', '', ''
+        if not self._pending_promotion:
+            return False, '대기 중인 승격 수가 없습니다', '', ''
+        from_sq = self._pending_promotion['from']
+        to_sq = self._pending_promotion['to']
+        return self.confirm_player_move(
+            promotion_piece=piece,
+            from_square=from_sq,
+            to_square=to_sq,
+        )
+
+    def correct_board(
         self,
-        fen_before: str,
-        from_sq: str,
-        to_sq: str,
-    ) -> None:
-        uci = f'{from_sq}{to_sq}'
-        if not self._is_legal_uci(fen_before, uci):
+        fen: str,
+        *,
+        graveyard_slots: list[str | None] | None = None,
+        human_graveyard_slots: list[str | None] | None = None,
+    ) -> tuple[bool, str]:
+        if self.bot_status in ('thinking', 'moving'):
+            raise RuntimeError('봇이 동작 중입니다. 잠시 후 다시 시도하세요.')
+
+        fen = fen.strip()
+        if not fen:
+            raise ValueError('FEN이 비어 있습니다')
+
+        try:
+            chess.Board(fen)
+        except ValueError as exc:
+            raise ValueError(f'잘못된 FEN: {exc}') from exc
+
+        with self._bot_lock:
+            self._bot_busy = False
+            self._bot_pending_fen = ''
+        self.bot_status = 'idle'
+        self.promotion_notice = ''
+        self._pending_promotion = None
+
+        fen_before = self.latest_fen
+        if graveyard_slots is not None:
+            self.graveyard_slots = list(graveyard_slots)
+        if human_graveyard_slots is not None:
+            self.human_graveyard_slots = list(human_graveyard_slots)
+        else:
+            self.graveyard_slots, self.human_graveyard_slots = reconcile_graveyards_with_fen(
+                fen_before,
+                fen,
+                self.graveyard_slots,
+                self.human_graveyard_slots,
+                robot_side=robot_graveyard_side(self._human_color()),
+                human_side=human_graveyard_side(self._human_color()),
+            )
+
+        logical_ok, logical_msg = self._sync_logical_board(fen)
+        if not logical_ok:
+            return False, logical_msg
+
+        sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+        if not sync_ok:
+            self.get_logger().warn(f'robot board sync after correct_board failed: {sync_msg}')
+
+        self._refresh_game_phase(self.latest_fen)
+        self.eval_cp = self._eval_from_human_perspective()
+        self.latest_from = ''
+        self.latest_to = ''
+        self._ensure_active_game()
+        self.latest_message = '보드가 수동 정정되었습니다. 수 두었음을 다시 시도하세요.'
+        self._spin_for_updates()
+        self._persist_game_state()
+        return True, self.latest_message
+
+    def _process_player_move_feedback(self, fen_before: str, uci: str) -> None:
+        legal = resolve_legal_uci_full(uci, fen_before)
+        if legal is None:
             return
 
         board = chess.Board(fen_before)
-        move = chess.Move.from_uci(uci)
-        is_capture = board.is_capture(move)
+        move = chess.Move.from_uci(legal)
+        is_capture = board.is_capture(move) or board.is_en_passant(move)
         board.push(move)
         is_check = board.is_check()
 
         classification = self._with_engine(
-            lambda: self._engine.classify_move(fen_before, uci)
+            lambda: self._engine.classify_move(fen_before, legal)
         )
         self.eval_cp = self._eval_from_human_perspective()
         self._append_move_history(
             fen_before=fen_before,
-            uci=uci,
+            uci=legal,
             color=self._human_color(),
             eval_cp=self.eval_cp,
             quality=classification.quality,
         )
-        san = self._uci_to_san(fen_before, uci)
+        san = self._uci_to_san(fen_before, legal)
         self.bot_message = react_to_player_move(
             self._difficulty(),
             quality=classification.quality,
@@ -522,21 +999,21 @@ class WebBridgeNode(Node):
             san=san,
         )
 
-    def _process_bot_move_feedback(self, fen_before: str, from_uci: str, to_uci: str) -> None:
-        uci = f'{from_uci}{to_uci}'
-        if not self._is_legal_uci(fen_before, uci):
+    def _process_bot_move_feedback(self, fen_before: str, uci: str) -> None:
+        legal = resolve_legal_uci_full(uci, fen_before)
+        if legal is None:
             return
 
         board = chess.Board(fen_before)
-        move = chess.Move.from_uci(uci)
-        is_capture = board.is_capture(move)
+        move = chess.Move.from_uci(legal)
+        is_capture = board.is_capture(move) or board.is_en_passant(move)
         board.push(move)
         is_check = board.is_check()
 
         self.eval_cp = self._eval_from_human_perspective()
         self._append_move_history(
             fen_before=fen_before,
-            uci=uci,
+            uci=legal,
             color=self._robot_color(),
             eval_cp=self.eval_cp,
         )
@@ -545,28 +1022,20 @@ class WebBridgeNode(Node):
             is_capture=is_capture,
             is_check=is_check,
         )
+        promo = promotion_piece_char(move)
+        if promo:
+            self.promotion_notice = promotion_notice(legal[:2], legal[2:4], promo)
 
     def _apply_robot_move_service(
         self,
-        from_uci: str,
-        to_uci: str,
+        uci: str,
+        fen: str,
         *,
-        is_capture: bool,
         timeout_sec: float = 30.0,
     ) -> tuple[bool, str, object | None]:
-        from_col = ord(from_uci[0]) - ord('a')
-        from_row = int(from_uci[1]) - 1
-        to_col = ord(to_uci[0]) - ord('a')
-        to_row = int(to_uci[1]) - 1
-
         apply_req = ApplyRobotMove.Request()
         apply_req.move = ChessMove()
-        apply_req.move.from_square.col = from_col
-        apply_req.move.from_square.row = from_row
-        apply_req.move.to_square.col = to_col
-        apply_req.move.to_square.row = to_row
-        apply_req.move.promotion = ''
-        apply_req.move.is_capture = is_capture
+        legal = self._fill_chess_move(apply_req.move, fen, uci)
         apply_result, err = self._call_service(
             self.apply_robot_client,
             apply_req,
@@ -578,24 +1047,15 @@ class WebBridgeNode(Node):
             return False, apply_result.message, apply_result
         self._sync_from_apply_result(apply_result)
         self._spin_for_updates()
-        return True, apply_result.message, apply_result
+        return True, apply_result.message or legal, apply_result
 
-    def _execute_physical_move(self, from_uci: str, to_uci: str, *, is_capture: bool) -> tuple[bool, str]:
+    def _execute_physical_move(self, uci: str, *, fen: str) -> tuple[bool, str]:
         if not self.action_client.wait_for_server(timeout_sec=5.0):
             return False, 'execute_move action unavailable'
 
-        from_col = ord(from_uci[0]) - ord('a')
-        from_row = int(from_uci[1]) - 1
-        to_col = ord(to_uci[0]) - ord('a')
-        to_row = int(to_uci[1]) - 1
-
         goal = ExecuteMove.Goal()
-        goal.move.from_square.col = from_col
-        goal.move.from_square.row = from_row
-        goal.move.to_square.col = to_col
-        goal.move.to_square.row = to_row
-        goal.move.promotion = ''
-        goal.move.is_capture = is_capture
+        goal.move = ChessMove()
+        self._fill_chess_move(goal.move, fen, uci)
 
         send_future = self.action_client.send_goal_async(goal)
         rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
@@ -621,40 +1081,41 @@ class WebBridgeNode(Node):
             return False, result.message
         return True, result.message
 
-    def _push_local_fen_move(self, from_uci: str, to_uci: str, *, fen: str) -> bool:
+    def _push_local_fen_move(self, uci: str, *, fen: str) -> bool:
         """Apply a move to local FEN only (fallback when vision_game sync fails)."""
+        legal = resolve_legal_uci_full(uci, fen)
+        if legal is None:
+            return False
         try:
             board = chess.Board(fen)
-            move = chess.Move.from_uci(f'{from_uci}{to_uci}')
-            if move not in board.legal_moves:
-                return False
-            board.push(move)
+            board.push_uci(legal)
             self._sync_from_fen(board.fen())
             return True
         except ValueError:
             return False
 
-    def _mark_bot_move_metadata(self, from_uci: str, to_uci: str) -> None:
-        self.latest_from = from_uci
-        self.latest_to = to_uci
-        self.last_bot_move = f'{from_uci}{to_uci}'
+    def _mark_bot_move_metadata(self, uci: str) -> None:
+        self.latest_from = uci[:2]
+        self.latest_to = uci[2:4]
+        self.last_bot_move = uci
 
     def execute_bot_move(
         self,
-        from_uci: str,
-        to_uci: str,
+        uci: str,
         *,
         fen: str | None = None,
     ) -> tuple[bool, str]:
         """Move the arm first; update grid and vision_game only after physical success."""
         fen_before = fen or self.latest_fen
-        is_capture = self._move_is_capture(from_uci, to_uci, fen=fen_before)
+        legal = resolve_legal_uci_full(uci, fen_before)
+        if legal is None:
+            return False, f'illegal bot move: {uci}'
 
-        physical_ok, physical_msg = self._execute_physical_move(
-            from_uci,
-            to_uci,
-            is_capture=is_capture,
-        )
+        sync_ok, sync_msg = self._sync_robot_board(fen_before)
+        if not sync_ok:
+            return False, sync_msg
+
+        physical_ok, physical_msg = self._execute_physical_move(legal, fen=fen_before)
         if not physical_ok:
             self.latest_message = f'로봇 이동 실패: {physical_msg}'
             return False, physical_msg
@@ -662,9 +1123,8 @@ class WebBridgeNode(Node):
         logical_synced = False
         if self._vision_mode():
             logical_ok, logical_msg, _ = self._apply_robot_move_service(
-                from_uci,
-                to_uci,
-                is_capture=is_capture,
+                legal,
+                fen_before,
                 timeout_sec=10.0,
             )
             if logical_ok:
@@ -674,50 +1134,47 @@ class WebBridgeNode(Node):
                     f'vision_game sync failed after arm moved: {logical_msg}; applying local FEN'
                 )
 
-        if not logical_synced and not self._push_local_fen_move(
-            from_uci, to_uci, fen=fen_before
-        ):
+        if not logical_synced and not self._push_local_fen_move(legal, fen=fen_before):
             self.latest_message = (
-                f'로봇은 이동했으나 보드 상태 반영 실패: {from_uci} → {to_uci}'
+                f'로봇은 이동했으나 보드 상태 반영 실패: {legal[:2]} → {legal[2:4]}'
             )
             return False, 'logical board update failed after physical move'
 
-        self._record_capture(fen_before, from_uci, to_uci, by_robot=True)
-        self._mark_bot_move_metadata(from_uci, to_uci)
-        self._process_bot_move_feedback(fen_before, from_uci, to_uci)
-        self.latest_message = f'로봇 수: {from_uci} → {to_uci}'
+        self._record_capture(fen_before, legal, by_robot=True)
+        self._mark_bot_move_metadata(legal)
+        self._process_bot_move_feedback(fen_before, legal)
+        self.latest_message = f'로봇 수: {legal[:2]} → {legal[2:4]}'
+        self._update_game_over_state(self.latest_fen)
+        self.is_check = chess.Board(self.latest_fen).is_check()
+        self._persist_game_state()
         return True, physical_msg
-
-    def _move_is_capture(self, from_uci: str, to_uci: str, *, fen: str | None = None) -> bool:
-        try:
-            board = chess.Board(fen or self.latest_fen)
-            move = chess.Move.from_uci(f'{from_uci}{to_uci}')
-            return board.is_capture(move)
-        except ValueError:
-            return False
 
     def execute_move(self, from_uci: str, to_uci: str) -> tuple[bool, str]:
         """Manual/debug move: physical first, then logical (legacy path)."""
-        is_capture = self._move_is_capture(from_uci, to_uci)
-        physical_ok, physical_msg = self._execute_physical_move(
-            from_uci,
-            to_uci,
-            is_capture=is_capture,
-        )
+        uci = f'{from_uci}{to_uci}'
+        fen_before = self.latest_fen
+        legal = resolve_legal_uci_full(uci, fen_before)
+        if legal is None:
+            return False, f'illegal move: {uci}'
+
+        sync_ok, sync_msg = self._sync_robot_board(fen_before)
+        if not sync_ok:
+            return False, sync_msg
+
+        physical_ok, physical_msg = self._execute_physical_move(legal, fen=fen_before)
         if not physical_ok:
             return False, physical_msg
 
         if self._vision_mode():
             logical_ok, logical_msg, _ = self._apply_robot_move_service(
-                from_uci,
-                to_uci,
-                is_capture=is_capture,
+                legal,
+                fen_before,
             )
             if not logical_ok:
                 return False, logical_msg
 
-        self.latest_from = from_uci
-        self.latest_to = to_uci
+        self.latest_from = legal[:2]
+        self.latest_to = legal[2:4]
         return True, physical_msg
 
 
@@ -751,6 +1208,13 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             raise HTTPException(status_code=503, detail=message)
         return {'success': success, 'message': message, **node.get_board_payload()}
 
+    @app.post('/api/restore_board')
+    def restore_board() -> dict[str, Any]:
+        success, message = node.restore_board_physical()
+        if not success:
+            raise HTTPException(status_code=503, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
+
     @app.post('/api/player-moved')
     def player_moved() -> dict[str, Any]:
         success, message, from_sq, to_sq = node.confirm_player_move()
@@ -779,6 +1243,34 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             'to': to_sq,
             **node.get_board_payload(),
         }
+
+    @app.post('/api/player-moved/promote')
+    def player_promotion(req: PromotionRequest) -> dict[str, Any]:
+        success, message, from_sq, to_sq = node.confirm_player_promotion(req.piece)
+        payload = {
+            'success': success,
+            'message': message,
+            'from': from_sq,
+            'to': to_sq,
+            **node.get_board_payload(),
+        }
+        return payload
+
+    @app.post('/api/board/correct')
+    def correct_board(req: BoardCorrectRequest) -> dict[str, Any]:
+        try:
+            success, message = node.correct_board(
+                req.fen,
+                graveyard_slots=req.graveyard_slots,
+                human_graveyard_slots=req.human_graveyard_slots,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
 
     @app.get('/api/camera/preview.jpg')
     def camera_preview() -> Response:

@@ -6,10 +6,14 @@ import {
   fetchBoard,
   postGameConfig,
   postPlayerMoved,
+  postPlayerPromote,
+  postBoardCorrect,
   resetBoard,
+  restoreBoard,
 } from './chess';
 import LobbyView from './views/LobbyView';
 import GameView from './views/GameView';
+import PromotionModal from './components/PromotionModal';
 import './styles/chess-theme.css';
 
 export default function App() {
@@ -20,6 +24,9 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [cameraTick, setCameraTick] = useState(0);
   const [error, setError] = useState('');
+  const [pendingPromotion, setPendingPromotion] = useState<{ from: string; to: string } | null>(
+    null,
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -63,11 +70,34 @@ export default function App() {
 
   const handleConfirmMove = async () => {
     setBusy(true);
+    setError('');
     try {
       const data = await postPlayerMoved();
       setBoard(data);
+      if (data.promotion_required && data.from && data.to) {
+        setPendingPromotion({ from: data.from, to: data.to });
+      } else {
+        setPendingPromotion(null);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '수 감지 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handlePromotionPick = async (piece: 'q' | 'r' | 'b' | 'n') => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postPlayerPromote(piece);
+      setBoard(data);
+      setPendingPromotion(null);
+      if (!data.success && !data.promotion_required) {
+        setError(data.message || '승격 처리 실패');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '승격 처리 실패');
     } finally {
       setBusy(false);
     }
@@ -87,10 +117,43 @@ export default function App() {
     }
   };
 
+  const handleRestore = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await restoreBoard();
+      setBoard(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '보드 정리 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleBackToLobby = () => {
     setScreen('lobby');
     setBoard(null);
     setError('');
+  };
+
+  const handleBoardCorrect = async (
+    fen: string,
+    graveyards?: {
+      graveyard_slots?: (string | null)[];
+      human_graveyard_slots?: (string | null)[];
+    },
+  ) => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postBoardCorrect(fen, graveyards);
+      setBoard(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '보드 정정 실패');
+      throw err;
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -115,11 +178,23 @@ export default function App() {
           busy={busy}
           onConfirmMove={handleConfirmMove}
           onReset={handleReset}
+          onRestore={handleRestore}
           onBackToLobby={handleBackToLobby}
+          onBoardCorrect={handleBoardCorrect}
         />
       ) : (
         <p style={{ textAlign: 'center', color: '#9a9a9a' }}>로딩 중…</p>
       )}
+      {pendingPromotion ? (
+        <PromotionModal
+          fromSquare={pendingPromotion.from}
+          toSquare={pendingPromotion.to}
+          humanColor={humanColor}
+          busy={busy}
+          onPick={handlePromotionPick}
+          onCancel={() => setPendingPromotion(null)}
+        />
+      ) : null}
     </div>
   );
 }

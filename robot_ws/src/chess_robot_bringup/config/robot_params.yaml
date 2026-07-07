@@ -16,18 +16,34 @@ pick_place_node:
     gripper_port: "502"
     velocity: 120.0
     acceleration: 120.0
-    pick_velocity: 80.0
-    pick_acceleration: 80.0
-    place_velocity: 35.0
-    place_acceleration: 35.0
-    retreat_velocity: 60.0
-    retreat_acceleration: 60.0
+    pick_velocity: 100.0
+    pick_acceleration: 100.0
+    place_velocity: 70.0
+    place_acceleration: 70.0
+    retreat_velocity: 90.0
+    retreat_acceleration: 90.0
     home_velocity: 50.0
     home_acceleration: 50.0
-    z_approach_offset_mm: 25.0
+    z_approach_offset_mm: 0.0
     robot_id: dsr01
     robot_model: m0609
     home_joints: [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17]
-    discard_joints: [-1.33, -24.77, 109.43, -0.02, 95.34, -1.07]
+    robot_color: black
+    graveyard_enabled: true
+    graveyard_h9_joints: [-37.12, 8.08, 106.52, -0.02, 65.41, -36.25]
+    graveyard_square_mm: 40.0
+    graveyard_col_step_mm: -40.0
+    graveyard_row_step_mm: 40.0
+    # 흑 graveyard place 높이 보정 (음수 = 더 낮게). 2.5cm 낮춤
+    graveyard_z_offset_mm: -25.0
+    graveyard_z_pick_offset_mm: -25.0
+    # graveyard XY 이동 시 보드 travel 대비 추가 높이 (3cm)
+    graveyard_z_travel_extra_mm: 30.0
+    # optional; 0 = use h9 teach TCP z / anchor z + 90mm
+    graveyard_z_pick_mm: 0.0
+    graveyard_z_travel_mm: 0.0
+    graveyard_a0_joints: [19.87, 41.8, 56.67, -0.03, 81.53, 19.86]
+    white_graveyard_col_step_mm: 40.0
+    white_graveyard_row_step_mm: -40.0
     # observe 탑뷰 홈 (teach pendant로 측정 후 교체). vision_manual 모드에서는 publish false.
     publish_board_state: true

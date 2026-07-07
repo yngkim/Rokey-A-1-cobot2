@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import chess
 
+from chess_game.move_resolve import GameOutcome, game_outcome
+
 
 class GameState:
     MODE_MATCH = 0
@@ -27,8 +29,14 @@ class GameState:
         self.board.push_uci(uci)
         self.move_number = self.board.fullmove_number
 
+    def is_game_over(self) -> bool:
+        return self.board.is_game_over()
+
+    def outcome(self) -> GameOutcome:
+        return game_outcome(self.board)
+
     def apply_vision_move(self, from_square: str, to_square: str) -> bool:
-        """Update the display board from vision diff (may ignore chess legality)."""
+        """Debug-only: update board ignoring chess rules. Not used in production."""
         try:
             from_idx = chess.parse_square(from_square)
             to_idx = chess.parse_square(to_square)

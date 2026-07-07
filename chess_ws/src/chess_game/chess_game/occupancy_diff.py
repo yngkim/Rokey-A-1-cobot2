@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import chess
 
 from chess_game.board_utils import index_to_square_name, square_name_to_index
+from chess_game.move_resolve import captured_piece_symbol, resolve_legal_uci
 
 
 @dataclass
@@ -118,12 +119,83 @@ def _infer_from_square(
     return nearby[0][1]
 
 
+def _legal_destination_for_departed(
+    from_sq: str,
+    current_cells: list[bool],
+    previous_cells: list[bool],
+    fen: str,
+) -> str | None:
+    """Pick destination using legal moves (captures rank above occupancy heuristics)."""
+    board = chess.Board(fen)
+    try:
+        from_square = chess.parse_square(from_sq)
+    except ValueError:
+        return None
+
+    scored: list[tuple[int, str]] = []
+    for move in board.legal_moves:
+        if move.from_square != from_square:
+            continue
+        to_name = chess.square_name(move.to_square)
+        to_idx = square_name_to_index(to_name)
+        if not current_cells[to_idx]:
+            continue
+        score = chess.square_distance(from_square, move.to_square)
+        if board.is_capture(move):
+            score -= 20
+        if previous_cells[to_idx]:
+            score -= 10
+        scored.append((score, to_name))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda item: item[0])
+    best_score = scored[0][0]
+    top = [name for score, name in scored if score <= best_score + 1]
+    if len(top) == 1:
+        return top[0]
+    captures = [
+        name
+        for score, name in scored
+        if score <= best_score + 1 and board.is_capture(chess.Move.from_uci(f'{from_sq}{name}'))
+    ]
+    if len(captures) == 1:
+        return captures[0]
+    return scored[0][1]
+
+
+def _pair_two_departed_capture(
+    departed: list[str],
+    fen: str,
+) -> tuple[str, str] | None:
+    """Victim removed to graveyard; attacker may not register as arrived (2 departed, 0 arrived)."""
+    if len(departed) != 2:
+        return None
+
+    board = chess.Board(fen)
+    for from_sq in departed:
+        for victim_sq in departed:
+            if victim_sq == from_sq:
+                continue
+            try:
+                move = chess.Move.from_uci(f'{from_sq}{victim_sq}')
+            except ValueError:
+                continue
+            if move in board.legal_moves and board.is_capture(move):
+                return from_sq, victim_sq
+    return None
+
+
 def _infer_to_square(
     previous_cells: list[bool],
     current_cells: list[bool],
     from_square: str,
     fen: str,
 ) -> str | None:
+    legal_to = _legal_destination_for_departed(from_square, current_cells, previous_cells, fen)
+    if legal_to is not None:
+        return legal_to
+
     board = chess.Board(fen)
     from_idx = square_name_to_index(from_square)
     from_col = from_idx % 8
@@ -146,6 +218,12 @@ def _infer_to_square(
             continue
         was_occupied = previous_cells[idx]
         bonus = 0 if was_occupied else -1
+        try:
+            move = chess.Move.from_uci(f'{from_square}{index_to_square_name(idx)}')
+            if move in board.legal_moves and board.is_capture(move):
+                bonus -= 15
+        except ValueError:
+            pass
         scored.append((dist + bonus, index_to_square_name(idx)))
 
     if not scored:
@@ -206,24 +284,12 @@ def infer_captured_piece(
     baseline: list[bool] | None = None,
 ) -> str:
     """Return FEN symbol of captured piece, or '' if not a capture."""
+    del departed, baseline
     board = chess.Board(fen)
-    try:
-        move = chess.Move.from_uci(f'{from_sq}{to_sq}')
-        if board.is_capture(move):
-            piece = board.piece_at(move.to_square)
-            return piece.symbol() if piece is not None else ''
-    except ValueError:
-        pass
-
-    # Capture: destination reads departed before the attacker lands (2 departed, 1 arrived).
-    if departed and to_sq in departed and len(departed) >= 2:
-        try:
-            piece = board.piece_at(chess.parse_square(to_sq))
-            if piece is not None:
-                return piece.symbol()
-        except ValueError:
-            pass
-
+    uci = resolve_legal_uci(fen, from_sq, to_sq)
+    if uci is not None:
+        move = chess.Move.from_uci(uci)
+        return captured_piece_symbol(board, move)
     return ''
 
 
@@ -253,6 +319,34 @@ def _pair_departed_arrived(
     return best[1], best[2]
 
 
+def _filter_arrived_by_legal_moves(
+    departed: list[str],
+    arrived: list[str],
+    fen: str,
+) -> list[str]:
+    """Remove depth false-positives when one piece left and multiple squares look occupied."""
+    if len(departed) != 1 or len(arrived) < 2:
+        return arrived
+
+    board = chess.Board(fen)
+    from_sq = departed[0]
+    try:
+        from_square = chess.parse_square(from_sq)
+    except ValueError:
+        return arrived
+
+    legal_destinations = {
+        chess.square_name(move.to_square)
+        for move in board.legal_moves
+        if move.from_square == from_square
+    }
+    if not legal_destinations:
+        return arrived
+
+    filtered = [sq for sq in arrived if sq in legal_destinations]
+    return filtered if filtered else arrived
+
+
 def detect_move_from_diff(
     previous_cells: list[bool],
     current_cells: list[bool],
@@ -260,6 +354,7 @@ def detect_move_from_diff(
 ) -> DiffMoveResult | None:
     """Detect a single move from occupancy before/after snapshots."""
     departed, arrived = _departed_arrived(previous_cells, current_cells)
+    arrived = _filter_arrived_by_legal_moves(departed, arrived, fen)
 
     if len(departed) == 2 and len(arrived) == 1:
         paired = _pair_capture_move(departed, arrived, fen)
@@ -289,9 +384,24 @@ def detect_move_from_diff(
                 via_inference=True,
             )
 
+    if len(departed) == 2 and len(arrived) == 0:
+        paired = _pair_two_departed_capture(departed, fen)
+        if paired is not None:
+            from_sq, to_sq = paired
+            return DiffMoveResult(
+                from_square=from_sq,
+                to_square=to_sq,
+                departed=departed,
+                arrived=arrived,
+                confident=True,
+                via_inference=True,
+            )
+
     if len(departed) == 1 and len(arrived) == 0:
         from_sq = departed[0]
-        to_sq = _infer_to_square(previous_cells, current_cells, from_sq, fen)
+        to_sq = _legal_destination_for_departed(from_sq, current_cells, previous_cells, fen)
+        if to_sq is None:
+            to_sq = _infer_to_square(previous_cells, current_cells, from_sq, fen)
         if to_sq:
             return DiffMoveResult(
                 from_square=from_sq,

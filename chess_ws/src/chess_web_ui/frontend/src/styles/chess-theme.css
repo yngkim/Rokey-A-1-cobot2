@@ -414,6 +414,76 @@ body {
   margin-bottom: 8px;
 }
 
+.board-edit-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.board-edit-palette {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.palette-btn {
+  width: 40px;
+  height: 40px;
+  padding: 4px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.2);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.palette-btn img {
+  width: 30px;
+  height: 30px;
+}
+
+.palette-btn-active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(129, 182, 76, 0.35);
+}
+
+.palette-erase {
+  font-size: 1.4rem;
+  line-height: 1;
+  color: #ccc;
+}
+
+.board-edit-controls {
+  display: flex;
+  gap: 8px;
+}
+
+.board-edit-error {
+  margin: 0;
+  color: #fa412d;
+  font-size: 0.9rem;
+}
+
+.chess-board-editing {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.square-editable {
+  cursor: pointer;
+}
+
+.square-editable:hover {
+  filter: brightness(1.08);
+}
+
 .action-btn {
   flex: 1;
   padding: 14px 16px;
@@ -469,4 +539,130 @@ body {
 .status-line {
   color: var(--text-muted);
   font-size: 0.9rem;
+}
+
+.promotion-notice {
+  max-width: 980px;
+  margin: 0 auto 10px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(255, 193, 7, 0.15);
+  border: 1px solid rgba(255, 193, 7, 0.45);
+  color: var(--text-primary);
+  font-size: 0.9rem;
+}
+
+.game-over-banner {
+  max-width: 980px;
+  margin: 0 auto 12px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  background: rgba(76, 175, 80, 0.12);
+  border: 1px solid rgba(76, 175, 80, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.promotion-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.promotion-modal {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  min-width: 280px;
+  text-align: center;
+}
+
+.promotion-modal h3 {
+  margin: 0 0 8px;
+}
+
+.promotion-options {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 16px 0;
+}
+
+.promotion-option {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 8px;
+  background: var(--bg-panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.promotion-option:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--clock-active);
+}
+
+.promotion-piece {
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.promotion-cancel {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 8px 16px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.graveyard-edit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.graveyard-edit {
+  background: var(--bg-panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.graveyard-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.graveyard-pieces {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 4px;
+}
+
+.graveyard-slot {
+  aspect-ratio: 1;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 1rem;
+  cursor: pointer;
+  padding: 0;
+}
+
+.graveyard-slot.occupied {
+  border-color: var(--accent);
 }

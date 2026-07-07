@@ -55,6 +55,9 @@ class OrchestratorCore:
             fen_before = self.game.fen
             self.game.apply_uci(result.best)
             self.previous_cells = list(cells)
+            if self.game.is_game_over():
+                self.phase = GamePhase.WAIT_USER_MOVE
+                return
             if self.game.mode == GameState.MODE_COACH:
                 self.coach.evaluate_move(fen_before, result.best)
             self.phase = GamePhase.ROBOT_PLANNING
@@ -62,6 +65,9 @@ class OrchestratorCore:
             self.phase = GamePhase.UI_CONFIRM
 
     def plan_robot_move(self) -> str:
+        if self.game.is_game_over():
+            self.phase = GamePhase.WAIT_USER_MOVE
+            raise RuntimeError('game is over; cannot plan robot move')
         self._pending_robot_move = self.engine.best_move_uci(self.game.fen)
         self.phase = GamePhase.ROBOT_EXECUTING
         return self._pending_robot_move

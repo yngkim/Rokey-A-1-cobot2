@@ -10,18 +10,28 @@ type Props = {
   board: BoardResponse;
   humanColor: HumanColor;
   highlightSquares?: { from?: string; to?: string };
+  editable?: boolean;
+  draftGrid?: (string | null)[][];
+  onSquareClick?: (square: string) => void;
 };
 
-export default function ChessBoard({ board, humanColor, highlightSquares }: Props) {
-  const fenBoard = parseFenBoard(board.fen);
+export default function ChessBoard({
+  board,
+  humanColor,
+  highlightSquares,
+  editable = false,
+  draftGrid,
+  onSquareClick,
+}: Props) {
+  const fenBoard = draftGrid ?? parseFenBoard(board.fen);
   const flip = humanColor === 'black';
-  const lastFrom = board.from ?? '';
-  const lastTo = board.to ?? '';
+  const lastFrom = editable ? '' : (board.from ?? '');
+  const lastTo = editable ? '' : (board.to ?? '');
 
   const displayRows = flip ? [...fenBoard].reverse() : fenBoard;
 
   return (
-    <div className="chess-board">
+    <div className={`chess-board${editable ? ' chess-board-editing' : ''}`}>
       {displayRows.map((row, rowIdx) => {
         const rowFromTop = flip ? rowIdx : 7 - rowIdx;
         return (
@@ -40,12 +50,26 @@ export default function ChessBoard({ board, humanColor, highlightSquares }: Prop
               return (
                 <div
                   key={sq}
+                  role={editable ? 'button' : undefined}
+                  tabIndex={editable ? 0 : undefined}
+                  onClick={editable && onSquareClick ? () => onSquareClick(sq) : undefined}
+                  onKeyDown={
+                    editable && onSquareClick
+                      ? (e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            onSquareClick(sq);
+                          }
+                        }
+                      : undefined
+                  }
                   className={[
                     'square',
                     light ? 'light' : 'dark',
                     isLast ? 'last-move' : '',
                     hlFrom ? 'highlight-from' : '',
                     hlTo ? 'highlight-to' : '',
+                    editable ? 'square-editable' : '',
                   ].filter(Boolean).join(' ')}
                 >
                   {piece ? (
