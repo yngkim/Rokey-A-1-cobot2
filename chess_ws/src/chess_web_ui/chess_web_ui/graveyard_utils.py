@@ -5,13 +5,13 @@ from __future__ import annotations
 BLACK_GRAVEYARD_FILL_ORDER: list[tuple[int, int]] = [
     (col, 0) for col in range(7, -1, -1)
 ] + [
-    (col, 1) for col in range(8)
+    (col, 1) for col in range(7, -1, -1)
 ]
 
 WHITE_GRAVEYARD_FILL_ORDER: list[tuple[int, int]] = [
     (col, 0) for col in range(8)
 ] + [
-    (col, 1) for col in range(7, -1, -1)
+    (col, 1) for col in range(8)
 ]
 
 

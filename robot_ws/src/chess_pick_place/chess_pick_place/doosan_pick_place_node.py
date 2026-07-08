@@ -184,8 +184,7 @@ class DoosanPickPlaceNode(Node):
         travel_extra = float(self.get_parameter('graveyard_z_travel_extra_mm').value)
         if side == 'black':
             z_pick_mm += pick_offset
-        z_travel_mm += travel_extra
-        self._graveyard_pose_maps[side] = GraveyardPoseMap(
+        gy_map = GraveyardPoseMap(
             anchor_h9_posx=anchor,
             col_step_mm=col_step,
             row_step_mm=row_step,
@@ -193,11 +192,13 @@ class DoosanPickPlaceNode(Node):
             z_pick_mm=z_pick_mm,
             z_travel_mm=z_travel_mm,
         )
+        gy_map.travel_extra_mm = travel_extra
+        self._graveyard_pose_maps[side] = gy_map
         pose_map = self._graveyard_pose_maps[side]
         self.get_logger().info(
             f'graveyard {anchor_name} anchor: xy={pose_map.anchor_x},'
             f'{pose_map.anchor_y} z_pick={pose_map.z_pick_mm} '
-            f'z_travel={pose_map.z_travel_mm}'
+            f'z_travel={pose_map.z_travel_mm} travel_extra={pose_map.travel_extra_mm}'
         )
         if return_home:
             self._go_home()
@@ -263,15 +264,15 @@ class DoosanPickPlaceNode(Node):
         self.declare_parameter('graveyard_h9_joints', [-37.12, 8.08, 106.52, -0.02, 65.41, -36.25])
         self.declare_parameter('graveyard_square_mm', 40.0)
         self.declare_parameter('graveyard_col_step_mm', -40.0)
-        self.declare_parameter('graveyard_row_step_mm', 40.0)
+        self.declare_parameter('graveyard_row_step_mm', -40.0)
         self.declare_parameter('graveyard_z_pick_mm', 0.0)
         self.declare_parameter('graveyard_z_travel_mm', 0.0)
         self.declare_parameter('graveyard_z_offset_mm', 0.0)  # deprecated: use graveyard_z_pick_offset_mm
         self.declare_parameter('graveyard_z_pick_offset_mm', 0.0)
-        self.declare_parameter('graveyard_z_travel_extra_mm', 30.0)
+        self.declare_parameter('graveyard_z_travel_extra_mm', 0.0)
         self.declare_parameter('graveyard_a0_joints', [19.87, 41.8, 56.67, -0.03, 81.53, 19.86])
         self.declare_parameter('white_graveyard_col_step_mm', 40.0)
-        self.declare_parameter('white_graveyard_row_step_mm', -40.0)
+        self.declare_parameter('white_graveyard_row_step_mm', 40.0)
 
     def _init_gripper(self) -> None:
         self.gripper = RG(
@@ -547,7 +548,13 @@ class DoosanPickPlaceNode(Node):
                 self._close_gripper,
                 pose_map=graveyard_map,
             )
-            self.motion.place_piece_at(move.to_col, move.to_row, self._open_gripper)
+            self.motion.ensure_travel_height(self.pose_map)
+            self.motion.place_piece_at(
+                move.to_col,
+                move.to_row,
+                self._open_gripper,
+                pose_map=self.pose_map,
+            )
         elif move.kind == 'board_to_graveyard':
             self.motion.pick_piece_at(move.from_col, move.from_row, self._close_gripper)
             self.motion.place_piece_at(

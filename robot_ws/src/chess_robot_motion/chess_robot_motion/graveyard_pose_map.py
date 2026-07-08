@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# h9 -> g9 -> ... -> a9 -> a10 -> ... -> h10 (serpentine)
+# h9 -> g9 -> ... -> a9 -> h10 -> ... -> a10 (same X direction per row)
 BLACK_GRAVEYARD_FILL_ORDER: list[tuple[int, int]] = [
     (col, 0) for col in range(7, -1, -1)
 ] + [
-    (col, 1) for col in range(8)
+    (col, 1) for col in range(7, -1, -1)
 ]
 
-# a0 -> b0 -> ... -> h0 -> h-1 -> ... -> a-1 (serpentine)
+# a0 -> b0 -> ... -> h0 -> a-1 -> ... -> h-1 (same X direction per row)
 WHITE_GRAVEYARD_FILL_ORDER: list[tuple[int, int]] = [
     (col, 0) for col in range(8)
 ] + [
-    (col, 1) for col in range(7, -1, -1)
+    (col, 1) for col in range(8)
 ]
 
 # Backward-compatible alias
@@ -68,6 +68,12 @@ class GraveyardPoseMap:
         self.row_step_mm = row_step_mm
         self.z_pick_mm = self.anchor_z if z_pick_mm is None else z_pick_mm
         self.z_travel_mm = (self.z_pick_mm + 90.0) if z_travel_mm is None else z_travel_mm
+        self.travel_extra_mm = 0.0
+
+    @property
+    def z_travel_effective_mm(self) -> float:
+        """Travel Z over graveyard (board travel + optional extra clearance)."""
+        return self.z_travel_mm + self.travel_extra_mm
 
     def square_center_xy(self, col: int, grave_row: int) -> tuple[float, float]:
         if not (0 <= col <= 7 and 0 <= grave_row <= 1):
@@ -82,4 +88,4 @@ class GraveyardPoseMap:
         return [x, y, z_val, *self.fixed_orientation]
 
     def square_to_travel_posx(self, col: int, grave_row: int) -> list[float]:
-        return self.square_to_posx(col, grave_row, z=self.z_travel_mm)
+        return self.square_to_posx(col, grave_row, z=self.z_travel_effective_mm)

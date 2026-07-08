@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from typing import Literal
 
 Difficulty = Literal['easy', 'medium', 'hard']
+BanterKind = Literal['greeting', 'game_over', 'check', 'capture', 'move']
+
+
+@dataclass(frozen=True)
+class BanterLine:
+    text: str
+    kind: BanterKind
+
 
 BOT_PROFILES: dict[Difficulty, dict[str, str]] = {
     'easy': {
@@ -69,8 +78,8 @@ def get_bot_profile(difficulty: Difficulty) -> dict[str, str]:
     return dict(BOT_PROFILES[difficulty])
 
 
-def greeting(difficulty: Difficulty) -> str:
-    return BOT_PROFILES[difficulty]['greeting']
+def greeting(difficulty: Difficulty) -> BanterLine:
+    return BanterLine(BOT_PROFILES[difficulty]['greeting'], 'greeting')
 
 
 def react_to_player_move(
@@ -80,15 +89,18 @@ def react_to_player_move(
     is_capture: bool,
     is_check: bool,
     san: str,
-) -> str:
+) -> BanterLine:
     del san
     pool_key = quality if quality in ('brilliant', 'good', 'inaccuracy', 'mistake', 'blunder') else 'good'
+    kind: BanterKind = 'move'
     if is_check:
         pool_key = 'check'
+        kind = 'check'
     elif is_capture and quality in ('mistake', 'blunder', 'inaccuracy'):
         pool_key = 'capture'
+        kind = 'capture'
     lines = _PLAYER_RESPONSES[difficulty].get(pool_key, _PLAYER_RESPONSES[difficulty]['good'])
-    return random.choice(lines)
+    return BanterLine(random.choice(lines), kind)
 
 
 def react_to_game_over(
@@ -96,22 +108,25 @@ def react_to_game_over(
     *,
     result: str,
     winner: str,
-) -> str:
+) -> BanterLine:
     del difficulty
     if result == 'checkmate':
         if winner == 'human':
-            return '체크메이트! 이번 판은 당신 승리입니다.'
+            return BanterLine('체크메이트! 이번 판은 당신 승리입니다.', 'game_over')
         if winner == 'robot':
-            return '체크메이트. 이번 판은 내 승리다.'
+            return BanterLine('체크메이트. 이번 판은 내 승리다.', 'game_over')
     if result == 'stalemate':
-        return '스테일메이트. 무승부입니다.'
-    return '무승부로 게임이 끝났습니다.'
+        return BanterLine('스테일메이트. 무승부입니다.', 'game_over')
+    if result == 'resign':
+        return BanterLine('기권하셨군요. 이번 판은 제 승리입니다.', 'game_over')
+    return BanterLine('무승부로 게임이 끝났습니다.', 'game_over')
 
 
-def react_to_bot_move(difficulty: Difficulty, *, is_capture: bool, is_check: bool) -> str:
+def react_to_bot_move(difficulty: Difficulty, *, is_capture: bool, is_check: bool) -> BanterLine:
     base = random.choice(_BOT_MOVE_LINES[difficulty])
     if is_check and difficulty != 'hard':
-        return f'{base} 장군!'
+        return BanterLine(f'{base} 장군!', 'check')
     if is_capture and difficulty == 'easy':
-        return f'{base} 잡았다!'
-    return base
+        return BanterLine(f'{base} 잡았다!', 'capture')
+    kind: BanterKind = 'check' if is_check else ('capture' if is_capture else 'move')
+    return BanterLine(base, kind)

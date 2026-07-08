@@ -81,12 +81,12 @@ export default function ChessBoard({
                     />
                   ) : null}
                   {showFile ? (
-                    <span className="coord file" style={{ color: light ? '#779556' : '#ebecd0' }}>
+                    <span className="coord file" style={{ color: light ? '#ebecd0' : '#779556' }}>
                       {sq[0]}
                     </span>
                   ) : null}
                   {showRank ? (
-                    <span className="coord rank" style={{ color: light ? '#779556' : '#ebecd0' }}>
+                    <span className="coord rank" style={{ color: light ? '#ebecd0' : '#779556' }}>
                       {sq[1]}
                     </span>
                   ) : null}

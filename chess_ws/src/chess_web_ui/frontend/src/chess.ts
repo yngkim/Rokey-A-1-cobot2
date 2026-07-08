@@ -29,7 +29,10 @@ export type GameResult =
   | 'fifty_moves'
   | 'repetition'
   | 'draw'
+  | 'resign'
   | '';
+
+export type BotSpeechKind = 'greeting' | 'game_over' | 'check' | 'capture' | 'move';
 
 export type BoardResponse = {
   fen: string;
@@ -50,6 +53,7 @@ export type BoardResponse = {
   move_history?: MoveRecord[];
   eval_cp?: number;
   bot_message?: string;
+  bot_speech_kind?: BotSpeechKind;
   bot_profile?: BotProfile;
   game_phase?: GamePhase;
   game_result?: GameResult;
@@ -176,6 +180,40 @@ export function pieceImageUrl(piece: string): string {
   return `/pieces/cburnett/${key}.svg`;
 }
 
+export type GraveyardSide = 'black' | 'white';
+
+export function graveyardSlotLabel(side: GraveyardSide, col: number, graveRow: number): string {
+  if (side === 'white') {
+    if (graveRow === 0) return `${FILES[col]}0`;
+    return `${FILES[col]}-1`;
+  }
+  return `${FILES[col]}${9 + graveRow}`;
+}
+
+export function graveyardSlotIndex(col: number, graveRow: number): number {
+  return graveRow * 8 + col;
+}
+
+export function graveyardFillOrder(side: GraveyardSide): [number, number][] {
+  if (side === 'white') {
+    const row0 = Array.from({ length: 8 }, (_, col) => [col, 0] as [number, number]);
+    const row1 = Array.from({ length: 8 }, (_, col) => [col, 1] as [number, number]);
+    return [...row0, ...row1];
+  }
+  const row0 = Array.from({ length: 8 }, (_, i) => [7 - i, 0] as [number, number]);
+  const row1 = Array.from({ length: 8 }, (_, i) => [7 - i, 1] as [number, number]);
+  return [...row0, ...row1];
+}
+
+export function graveyardDisplayRows(side: GraveyardSide): [number, number][][] {
+  const order = graveyardFillOrder(side);
+  return [order.slice(0, 8), order.slice(8, 16)];
+}
+
+export function robotGraveyardSide(humanColor: HumanColor): GraveyardSide {
+  return humanColor === 'white' ? 'black' : 'white';
+}
+
 export function cameraPreviewUrl(cacheBust: number): string {
   return `/api/camera/preview.jpg?t=${cacheBust}`;
 }
@@ -258,6 +296,13 @@ export async function postBoardCorrect(
   return data;
 }
 
+export async function postResign(): Promise<BoardResponse> {
+  const res = await fetch('/api/resign', { method: 'POST' });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'resign failed');
+  return data;
+}
+
 export function pieceLabel(piece: string | null): string {
   if (!piece) return '';
   const map: Record<string, string> = {
@@ -281,6 +326,10 @@ export function turnLabel(board: BoardResponse | null): string {
       if (board.winner === 'robot') return '체크메이트 — 봇 승리';
     }
     if (board.game_result === 'stalemate') return '스테일메이트 — 무승부';
+    if (board.game_result === 'resign') {
+      if (board.winner === 'robot') return '기권 — 패배';
+      return '기권';
+    }
     return '게임 종료 — 무승부';
   }
   if (board.is_check && isHumanTurn(board)) return '체크! 당신 차례';

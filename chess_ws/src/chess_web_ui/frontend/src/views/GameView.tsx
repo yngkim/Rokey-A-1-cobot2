@@ -7,6 +7,7 @@ import {
   cloneBoardGrid,
   isHumanTurn,
   parseFenBoard,
+  robotGraveyardSide,
   setSquarePiece,
   turnLabel,
   validateBoardGrid,
@@ -27,10 +28,13 @@ type Props = {
   humanColor: HumanColor;
   cameraTick: number;
   busy: boolean;
+  ttsMuted: boolean;
+  onToggleTtsMute: () => void;
   onConfirmMove: () => void;
   onReset: () => void;
   onRestore: () => void;
   onBackToLobby: () => void;
+  onResign: () => void;
   onBoardCorrect: (
     fen: string,
     graveyards?: {
@@ -45,10 +49,13 @@ export default function GameView({
   humanColor,
   cameraTick,
   busy,
+  ttsMuted,
+  onToggleTtsMute,
   onConfirmMove,
   onReset,
   onRestore,
   onBackToLobby,
+  onResign,
   onBoardCorrect,
 }: Props) {
   const [selectedPly, setSelectedPly] = useState<number | null>(null);
@@ -74,6 +81,7 @@ export default function GameView({
       return '체크메이트';
     }
     if (board.game_result === 'stalemate') return '스테일메이트 — 무승부';
+    if (board.game_result === 'resign') return '기권 — 패배';
     return '무승부';
   }, [board.game_result, board.winner, gameFinished]);
 
@@ -183,12 +191,14 @@ export default function GameView({
             onReset={onReset}
             onRestore={onRestore}
             onEdit={startEditing}
+            onResign={onResign}
             confirmDisabled={!humanTurn || botBusy || gameFinished}
             confirmBusy={busy}
             resetDisabled={botBusy || busy}
             restoreDisabled={botBusy || busy}
             restoreBusy={busy}
             editDisabled={botBusy || busy}
+            resignDisabled={botBusy || busy || gameFinished}
             editing={editing}
           />
           {editing && draftGrid ? (
@@ -208,12 +218,16 @@ export default function GameView({
             <div className="graveyard-edit-row">
               <GraveyardEditGrid
                 title="로봇 graveyard"
+                side={robotGraveyardSide(humanColor)}
                 slots={draftRobotGraveyard}
+                selectedPiece={selectedPiece}
                 onChange={setDraftRobotGraveyard}
               />
               <GraveyardEditGrid
                 title="사용자 graveyard"
+                side={humanColor}
                 slots={draftHumanGraveyard}
+                selectedPiece={selectedPiece}
                 onChange={setDraftHumanGraveyard}
               />
             </div>
@@ -245,6 +259,8 @@ export default function GameView({
             profile={profile}
             message={board.bot_message ?? ''}
             status={editing ? '보드 수정 중' : turnLabel(board)}
+            ttsMuted={ttsMuted}
+            onToggleTtsMute={onToggleTtsMute}
           />
           <EvalBar evalCp={board.eval_cp ?? 0} humanColor={humanColor} />
           <MoveList

@@ -15,7 +15,7 @@ class GraveyardGrid:
 
 
 class GraveyardState:
-    """16-slot graveyard: black h9->a10 or white a0->h-1."""
+    """16-slot graveyard: black h9->a9 then h10->a10, or white a0->h0 then a-1->h-1."""
 
     SLOT_COUNT = 16
 

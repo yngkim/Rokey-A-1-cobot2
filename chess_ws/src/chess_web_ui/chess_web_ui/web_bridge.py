@@ -31,6 +31,7 @@ from chess_web_ui.bot_banter import (
     react_to_game_over,
     react_to_player_move,
 )
+from chess_web_ui.capture_utils import resolve_capture_symbol
 from chess_web_ui.game_store import START_FEN, GameRecord, GameStore
 from chess_web_ui.graveyard_reconcile import reconcile_graveyards_with_fen
 from chess_web_ui.graveyard_utils import (
@@ -107,6 +108,7 @@ class WebBridgeNode(Node):
         self.move_history: list[dict[str, Any]] = []
         self.eval_cp = 0
         self.bot_message = ''
+        self.bot_speech_kind = 'move'
         self.game_phase: Literal['lobby', 'playing', 'finished'] = 'lobby'
         self.game_result: str = ''
         self.winner: Literal['human', 'robot', 'draw', ''] = ''
@@ -187,6 +189,10 @@ class WebBridgeNode(Node):
 
     def _bot_profile_payload(self) -> dict[str, str]:
         return get_bot_profile(self._difficulty())
+
+    def _set_bot_banter(self, line) -> None:
+        self.bot_message = line.text
+        self.bot_speech_kind = line.kind
 
     def _eval_from_human_perspective(self, fen: str | None = None) -> int:
         target = fen or self.latest_fen
@@ -294,6 +300,7 @@ class WebBridgeNode(Node):
         self._ply_counter = record.ply_counter
         self.eval_cp = record.eval_cp
         self.bot_message = record.bot_message
+        self.bot_speech_kind = 'move'
         self.game_phase = record.game_phase  # type: ignore[assignment]
         self.game_result = record.game_result
         self.winner = record.winner  # type: ignore[assignment]
@@ -393,17 +400,26 @@ class WebBridgeNode(Node):
 
     def _maybe_play_bot_move(self, fen: str) -> None:
         if self.game_phase == 'finished':
+            self.get_logger().info('bot move skipped: game finished')
             return
         if not fen or not self._auto_bot_move():
+            self.get_logger().info(
+                f'bot move skipped: fen={bool(fen)} auto_bot={self._auto_bot_move()}'
+            )
             return
         parts = fen.split()
         white_to_move = len(parts) > 1 and parts[1] == 'w'
         if not self._is_robot_turn(white_to_move):
+            self.get_logger().info(
+                f'bot move skipped: not robot turn (white_to_move={white_to_move})'
+            )
             return
         with self._bot_lock:
             if self._bot_busy:
+                self.get_logger().warn('bot move skipped: bot busy')
                 return
             if fen == self._bot_pending_fen:
+                self.get_logger().warn('bot move skipped: duplicate pending FEN')
                 return
             self._bot_busy = True
             self._bot_pending_fen = fen
@@ -548,15 +564,23 @@ class WebBridgeNode(Node):
             self.winner = 'human'
         else:
             self.winner = 'robot'
-        self.bot_message = react_to_game_over(
-            self._difficulty(),
-            result=self.game_result,
-            winner=self.winner,
+        self._set_bot_banter(
+            react_to_game_over(
+                self._difficulty(),
+                result=self.game_result,
+                winner=self.winner,
+            )
         )
         self._persist_game_state()
 
     def _human_won(self) -> bool:
         return self.winner == 'human'
+
+    def _normalize_graveyard_slots(self, slots: list[str | None] | None) -> list[str | None]:
+        normalized = list(slots or [])
+        if len(normalized) < 16:
+            normalized.extend([None] * (16 - len(normalized)))
+        return normalized[:16]
 
     def _record_capture(
         self,
@@ -564,14 +588,10 @@ class WebBridgeNode(Node):
         uci: str,
         *,
         by_robot: bool,
+        captured_symbol: str | None = None,
     ) -> None:
         try:
-            legal = resolve_legal_uci_full(uci, fen_before)
-            if legal is None:
-                return
-            board = chess.Board(fen_before)
-            move = chess.Move.from_uci(legal)
-            symbol = captured_piece_symbol(board, move)
+            symbol = resolve_capture_symbol(fen_before, uci, captured_symbol)
             if not symbol:
                 return
             captured = chess.Piece.from_symbol(symbol)
@@ -582,6 +602,7 @@ class WebBridgeNode(Node):
                 return
             if by_robot:
                 self.robot_captures.append(symbol)
+                self.graveyard_slots = self._normalize_graveyard_slots(self.graveyard_slots)
                 try:
                     self.graveyard_slots = place_in_graveyard(
                         self.graveyard_slots,
@@ -592,6 +613,9 @@ class WebBridgeNode(Node):
                     self.get_logger().warn('robot graveyard full while recording capture')
             else:
                 self.human_captures.append(symbol)
+                self.human_graveyard_slots = self._normalize_graveyard_slots(
+                    self.human_graveyard_slots
+                )
                 try:
                     self.human_graveyard_slots = place_in_graveyard(
                         self.human_graveyard_slots,
@@ -601,8 +625,8 @@ class WebBridgeNode(Node):
                 except ValueError:
                     self.get_logger().warn('human graveyard full while recording capture')
             self._persist_game_state()
-        except ValueError:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'failed to record capture for {uci}: {exc}')
 
     def get_board_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -621,6 +645,7 @@ class WebBridgeNode(Node):
             'move_history': list(self.move_history),
             'eval_cp': self.eval_cp,
             'bot_message': self.bot_message,
+            'bot_speech_kind': self.bot_speech_kind,
             'bot_profile': self._bot_profile_payload(),
             'game_phase': self.game_phase,
             'game_result': self.game_result,
@@ -666,7 +691,7 @@ class WebBridgeNode(Node):
         self.human_graveyard_slots = [None] * 16
         self._pending_promotion = None
         self.eval_cp = self._eval_from_human_perspective(START_FEN)
-        self.bot_message = greeting(self._difficulty())
+        self._set_bot_banter(greeting(self._difficulty()))
         self.game_phase = 'playing'
         self.game_result = ''
         self.winner = ''
@@ -767,6 +792,28 @@ class WebBridgeNode(Node):
 
         return True, result.message
 
+    def resign_game(self) -> tuple[bool, str]:
+        if self.game_phase == 'finished':
+            return False, '게임이 이미 종료되었습니다'
+        if self.bot_status in ('thinking', 'moving'):
+            with self._bot_lock:
+                self._bot_pending_fen = ''
+                self._bot_busy = False
+            self.bot_status = 'idle'
+        self.game_phase = 'finished'
+        self.game_result = 'resign'
+        self.winner = 'robot'
+        self._set_bot_banter(
+            react_to_game_over(
+                self._difficulty(),
+                result='resign',
+                winner='robot',
+            )
+        )
+        self._ensure_active_game()
+        self._persist_game_state()
+        return True, '기권했습니다'
+
     def _reset_robot(self) -> tuple[bool, str]:
         if not self.reset_client.wait_for_service(timeout_sec=2.0):
             return False, 'reset service unavailable'
@@ -810,6 +857,7 @@ class WebBridgeNode(Node):
             self.bot_status = 'idle'
             with self._bot_lock:
                 self._bot_pending_fen = ''
+                self._bot_busy = False
 
         fen_before = self.latest_fen
         request = ConfirmPlayerMove.Request()
@@ -847,10 +895,24 @@ class WebBridgeNode(Node):
         )
         legal = bool(uci) and self._is_legal_uci(fen_before, uci)
         success = bool(result.success) and legal
+        bot_fen = ''
 
         if success and uci:
-            self._record_capture(fen_before, uci, by_robot=False)
-            self._process_player_move_feedback(fen_before, uci)
+            self._ensure_active_game()
+            try:
+                captured = getattr(result, 'captured_piece', '') or ''
+                self._record_capture(
+                    fen_before,
+                    uci,
+                    by_robot=False,
+                    captured_symbol=captured or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'capture record raised unexpectedly: {exc}')
+            try:
+                self._process_player_move_feedback(fen_before, uci)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'player move feedback failed: {exc}')
             promo = getattr(result, 'promotion_piece', '') or ''
             if promo:
                 self.promotion_notice = promotion_notice(
@@ -866,23 +928,26 @@ class WebBridgeNode(Node):
 
         if success and getattr(result, 'fen', ''):
             self._sync_from_fen(result.fen)
+            bot_fen = self.latest_fen
         elif success and result.board_state is not None:
             self._apply_board_state_msg(result.board_state)
+            bot_fen = self.latest_fen
         elif not success and result.board_state is not None:
             self._apply_board_state_msg(result.board_state)
 
         self._spin_for_updates()
-        if success and self.latest_fen:
-            self._ensure_active_game()
-            sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+        if success and bot_fen:
+            sync_ok, sync_msg = self._sync_robot_board(bot_fen)
             if not sync_ok:
                 self.get_logger().warn(
                     f'robot board sync after player move failed: {sync_msg}'
                 )
-            self._update_game_over_state(self.latest_fen)
-            self.is_check = chess.Board(self.latest_fen).is_check()
+            self._update_game_over_state(bot_fen)
+            self.is_check = chess.Board(bot_fen).is_check()
             if self.game_phase != 'finished':
-                self._maybe_play_bot_move(self.latest_fen)
+                self._maybe_play_bot_move(bot_fen)
+            else:
+                self.get_logger().info('bot move skipped after player move: game finished')
 
         if success or result.success:
             self._persist_game_state()
@@ -991,12 +1056,14 @@ class WebBridgeNode(Node):
             quality=classification.quality,
         )
         san = self._uci_to_san(fen_before, legal)
-        self.bot_message = react_to_player_move(
-            self._difficulty(),
-            quality=classification.quality,
-            is_capture=is_capture,
-            is_check=is_check,
-            san=san,
+        self._set_bot_banter(
+            react_to_player_move(
+                self._difficulty(),
+                quality=classification.quality,
+                is_capture=is_capture,
+                is_check=is_check,
+                san=san,
+            )
         )
 
     def _process_bot_move_feedback(self, fen_before: str, uci: str) -> None:
@@ -1017,10 +1084,12 @@ class WebBridgeNode(Node):
             color=self._robot_color(),
             eval_cp=self.eval_cp,
         )
-        self.bot_message = react_to_bot_move(
-            self._difficulty(),
-            is_capture=is_capture,
-            is_check=is_check,
+        self._set_bot_banter(
+            react_to_bot_move(
+                self._difficulty(),
+                is_capture=is_capture,
+                is_check=is_check,
+            )
         )
         promo = promotion_piece_char(move)
         if promo:
@@ -1213,6 +1282,13 @@ def create_app(node: WebBridgeNode) -> FastAPI:
         success, message = node.restore_board_physical()
         if not success:
             raise HTTPException(status_code=503, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
+
+    @app.post('/api/resign')
+    def resign() -> dict[str, Any]:
+        success, message = node.resign_game()
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
         return {'success': success, 'message': message, **node.get_board_payload()}
 
     @app.post('/api/player-moved')

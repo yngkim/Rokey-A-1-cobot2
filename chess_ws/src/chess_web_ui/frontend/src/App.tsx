@@ -8,9 +8,12 @@ import {
   postPlayerMoved,
   postPlayerPromote,
   postBoardCorrect,
+  postResign,
   resetBoard,
   restoreBoard,
 } from './chess';
+import { useBotTts } from './hooks/useBotTts';
+import { loadUserSettings, type UserSettings } from './lib/userSettings';
 import LobbyView from './views/LobbyView';
 import GameView from './views/GameView';
 import PromotionModal from './components/PromotionModal';
@@ -21,12 +24,20 @@ export default function App() {
   const [board, setBoard] = useState<BoardResponse | null>(null);
   const [humanColor, setHumanColor] = useState<HumanColor>('white');
   const [difficulty, setDifficulty] = useState<Difficulty>('medium');
+  const [userSettings, setUserSettings] = useState<UserSettings>(() => loadUserSettings());
+  const [ttsMuted, setTtsMuted] = useState(false);
   const [busy, setBusy] = useState(false);
   const [cameraTick, setCameraTick] = useState(0);
   const [error, setError] = useState('');
   const [pendingPromotion, setPendingPromotion] = useState<{ from: string; to: string } | null>(
     null,
   );
+
+  useBotTts(board, {
+    enabled: screen === 'game',
+    settings: userSettings,
+    muted: ttsMuted,
+  });
 
   const refresh = useCallback(async () => {
     try {
@@ -133,6 +144,7 @@ export default function App() {
   const handleBackToLobby = () => {
     setScreen('lobby');
     setBoard(null);
+    setTtsMuted(false);
     setError('');
   };
 
@@ -156,6 +168,19 @@ export default function App() {
     }
   };
 
+  const handleResign = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postResign();
+      setBoard(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '기권 처리 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       {error ? (
@@ -166,8 +191,10 @@ export default function App() {
           difficulty={difficulty}
           humanColor={humanColor}
           busy={busy}
+          userSettings={userSettings}
           onDifficulty={setDifficulty}
           onColor={setHumanColor}
+          onUserSettings={setUserSettings}
           onStart={handleStart}
         />
       ) : board ? (
@@ -176,10 +203,13 @@ export default function App() {
           humanColor={humanColor}
           cameraTick={cameraTick}
           busy={busy}
+          ttsMuted={ttsMuted}
+          onToggleTtsMute={() => setTtsMuted((v) => !v)}
           onConfirmMove={handleConfirmMove}
           onReset={handleReset}
           onRestore={handleRestore}
           onBackToLobby={handleBackToLobby}
+          onResign={handleResign}
           onBoardCorrect={handleBoardCorrect}
         />
       ) : (
