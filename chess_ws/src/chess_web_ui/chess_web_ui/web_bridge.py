@@ -29,19 +29,46 @@ from chess_web_ui.bot_banter import (
     greeting,
     react_to_bot_move,
     react_to_game_over,
+    react_to_illegal_move,
+    react_to_illegal_move_reverted,
     react_to_player_move,
+    react_to_voice_empty,
+    react_to_voice_illegal,
+    react_to_voice_parse_error,
+    react_to_voice_promotion_required,
+    react_to_voice_success,
 )
+from chess_web_ui.board_correct_utils import infer_human_move_uci
 from chess_web_ui.capture_utils import resolve_capture_symbol
+from chess_web_ui.voice_move_parser import (
+    VoiceMoveParseError,
+    VoiceMoveParseOk,
+    parse_voice_move,
+    resolve_voice_move,
+)
 from chess_web_ui.game_store import START_FEN, GameRecord, GameStore
 from chess_web_ui.graveyard_reconcile import reconcile_graveyards_with_fen
 from chess_web_ui.graveyard_utils import (
+    graveyard_slot_index,
     human_graveyard_side,
     place_in_graveyard,
     robot_graveyard_side,
 )
 from chess_msgs.action import ExecuteMove, RestoreBoard
 from chess_msgs.msg import BoardState, ChessMove, GameSnapshot, Square
-from chess_msgs.srv import ApplyRobotMove, ConfirmPlayerMove, ResetBoard, ScanInitial, SetBoard
+from chess_msgs.srv import (
+    ApplyRobotMove,
+    ConfirmPlayerMove,
+    ResetBoard,
+    ScanInitial,
+    SetBoard,
+    UndoMoves,
+)
+from chess_web_ui.undo_utils import (
+    build_undo_moves_payload,
+    find_graveyard_slot_for_symbol,
+    make_ply_snapshot,
+)
 from cv_bridge import CvBridge
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,6 +103,17 @@ class BoardCorrectRequest(BaseModel):
 
 class PromotionRequest(BaseModel):
     piece: str
+
+
+class RevertIllegalMoveRequest(BaseModel):
+    from_square: str = Field(alias='from')
+    to: str
+
+    model_config = {'populate_by_name': True}
+
+
+class VoiceMoveRequest(BaseModel):
+    transcript: str
 
 
 class WebBridgeNode(Node):
@@ -117,7 +155,9 @@ class WebBridgeNode(Node):
         self._ply_counter = 0
         self.graveyard_slots: list[str | None] = [None] * 16
         self.human_graveyard_slots: list[str | None] = [None] * 16
+        self._undo_snapshots: list[dict[str, Any]] = []
         self._pending_promotion: dict[str, str] | None = None
+        self._pending_illegal_move: dict[str, str] | None = None
         self._active_game_id = ''
         db_path = str(self.get_parameter('game_db_path').value)
         self._game_store = GameStore(db_path)
@@ -154,6 +194,7 @@ class WebBridgeNode(Node):
         self.action_client = ActionClient(self, ExecuteMove, 'robot/execute_move')
         self.restore_action_client = ActionClient(self, RestoreBoard, 'robot/restore_board')
         self.robot_set_board_client = self.create_client(SetBoard, 'robot/set_board')
+        self.robot_undo_client = self.create_client(UndoMoves, 'robot/undo_moves')
         self.get_logger().info(
             f'Web bridge ready (human={self._human_color()}, auto_bot={self._auto_bot_move()}, '
             f'db={self._game_store.db_path})'
@@ -180,6 +221,13 @@ class WebBridgeNode(Node):
     def _is_robot_turn(self, white_to_move: bool) -> bool:
         robot_is_white = self._human_color() == 'black'
         return white_to_move == robot_is_white
+
+    @staticmethod
+    def _is_illegal_move_result(result, *, legal: bool, uci: str) -> bool:
+        msg = (getattr(result, 'message', '') or '').lower()
+        if 'illegal move' in msg:
+            return True
+        return bool(getattr(result, 'success', False) and uci and not legal)
 
     def _difficulty(self) -> Difficulty:
         level = str(self.get_parameter('difficulty').value).strip().lower()
@@ -655,6 +703,7 @@ class WebBridgeNode(Node):
             'game_id': self._active_game_id,
             'graveyard_slots': list(self.graveyard_slots),
             'human_graveyard_slots': list(self.human_graveyard_slots),
+            'undo_available': bool(self._undo_snapshots) and self.game_phase == 'playing',
             'promotion_required': self._pending_promotion is not None,
         }
         if self.latest_from and self.latest_to:
@@ -689,7 +738,9 @@ class WebBridgeNode(Node):
         self._ply_counter = 0
         self.graveyard_slots = [None] * 16
         self.human_graveyard_slots = [None] * 16
+        self._undo_snapshots = []
         self._pending_promotion = None
+        self._pending_illegal_move = None
         self.eval_cp = self._eval_from_human_perspective(START_FEN)
         self._set_bot_banter(greeting(self._difficulty()))
         self.game_phase = 'playing'
@@ -897,9 +948,36 @@ class WebBridgeNode(Node):
         success = bool(result.success) and legal
         bot_fen = ''
 
+        if self._is_illegal_move_result(result, legal=legal, uci=uci):
+            from_sq = (
+                getattr(result, 'from_square', '') or (uci[:2] if len(uci) >= 4 else '')
+            ).strip().lower()
+            to_sq = (
+                getattr(result, 'to_square', '') or (uci[2:4] if len(uci) >= 4 else '')
+            ).strip().lower()
+            if from_sq and to_sq:
+                self._pending_illegal_move = {'from': from_sq, 'to': to_sq}
+                self.latest_from = from_sq
+                self.latest_to = to_sq
+                self._set_bot_banter(
+                    react_to_illegal_move(
+                        self._difficulty(),
+                        from_sq=from_sq,
+                        to_sq=to_sq,
+                    )
+                )
+                self.latest_message = result.message or f'불법 수입니다: {from_sq} → {to_sq}'
+                if result.board_state is not None:
+                    self._apply_board_state_msg(result.board_state)
+                self._spin_for_updates()
+                self._persist_game_state()
+                return False, self.latest_message, from_sq, to_sq
+
         if success and uci:
+            self._pending_illegal_move = None
             self._ensure_active_game()
             try:
+                self._push_undo_snapshot(fen_before, uci, by_robot=False)
                 captured = getattr(result, 'captured_piece', '') or ''
                 self._record_capture(
                     fen_before,
@@ -948,6 +1026,23 @@ class WebBridgeNode(Node):
                 self._maybe_play_bot_move(bot_fen)
             else:
                 self.get_logger().info('bot move skipped after player move: game finished')
+
+        if not success and 'no move detected' in (result.message or '').lower():
+            if (
+                self.game_phase != 'finished'
+                and self._is_robot_turn(self.latest_white_to_move)
+            ):
+                self.get_logger().info(
+                    'confirm: board already reflects last move; triggering bot'
+                )
+                self._maybe_play_bot_move(self.latest_fen)
+                self._persist_game_state()
+                return (
+                    True,
+                    '이미 반영된 수입니다. 로봇이 응수합니다.',
+                    result.from_square,
+                    result.to_square,
+                )
 
         if success or result.success:
             self._persist_game_state()
@@ -999,6 +1094,7 @@ class WebBridgeNode(Node):
         self.bot_status = 'idle'
         self.promotion_notice = ''
         self._pending_promotion = None
+        self._pending_illegal_move = None
 
         fen_before = self.latest_fen
         if graveyard_slots is not None:
@@ -1015,7 +1111,27 @@ class WebBridgeNode(Node):
                 human_side=human_graveyard_side(self._human_color()),
             )
 
-        logical_ok, logical_msg = self._sync_logical_board(fen)
+        inferred_uci = infer_human_move_uci(fen_before, fen, self._human_color())
+        target_fen = fen
+        if inferred_uci:
+            board = chess.Board(fen_before)
+            board.push_uci(inferred_uci)
+            target_fen = board.fen()
+            try:
+                if graveyard_slots is None and human_graveyard_slots is None:
+                    self._record_capture(fen_before, inferred_uci, by_robot=False)
+                else:
+                    symbol = resolve_capture_symbol(fen_before, inferred_uci, None)
+                    if symbol and symbol not in self.human_captures:
+                        self.human_captures.append(symbol)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'capture record after board correction: {exc}')
+            try:
+                self._process_player_move_feedback(fen_before, inferred_uci)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'move feedback after board correction: {exc}')
+
+        logical_ok, logical_msg = self._sync_logical_board(target_fen)
         if not logical_ok:
             return False, logical_msg
 
@@ -1027,8 +1143,168 @@ class WebBridgeNode(Node):
         self.eval_cp = self._eval_from_human_perspective()
         self.latest_from = ''
         self.latest_to = ''
+        self._undo_snapshots = []
         self._ensure_active_game()
-        self.latest_message = '보드가 수동 정정되었습니다. 수 두었음을 다시 시도하세요.'
+        if inferred_uci:
+            self.latest_message = '보드 정정 후 수가 반영되었습니다.'
+        else:
+            self.latest_message = '보드가 수동 정정되었습니다. 수 두었음을 다시 시도하세요.'
+        self._update_game_over_state(self.latest_fen)
+        self.is_check = chess.Board(self.latest_fen).is_check()
+        if self.game_phase != 'finished':
+            self._maybe_play_bot_move(self.latest_fen)
+        self._spin_for_updates()
+        self._persist_game_state()
+        return True, self.latest_message
+
+    def _push_undo_snapshot(self, fen_before: str, uci: str, *, by_robot: bool) -> None:
+        self._undo_snapshots.append(
+            make_ply_snapshot(
+                fen=fen_before,
+                graveyard_slots=self.graveyard_slots,
+                human_graveyard_slots=self.human_graveyard_slots,
+                human_captures=self.human_captures,
+                robot_captures=self.robot_captures,
+                move_history=self.move_history,
+                ply_counter=self._ply_counter,
+                uci=uci,
+                by_robot=by_robot,
+            )
+        )
+
+    def _apply_undo_snapshot(self, snap: dict[str, Any]) -> None:
+        self._sync_from_fen(str(snap['fen']))
+        self.graveyard_slots = list(snap['graveyard_slots'])
+        self.human_graveyard_slots = list(snap['human_graveyard_slots'])
+        self.human_captures = list(snap['human_captures'])
+        self.robot_captures = list(snap['robot_captures'])
+        self.move_history = [dict(entry) for entry in snap['move_history']]
+        self._ply_counter = int(snap['ply_counter'])
+        self.game_phase = 'playing'
+        self.game_result = ''
+        self.winner = ''
+        self.promotion_notice = ''
+        self._pending_promotion = None
+        self.is_check = chess.Board(self.latest_fen).is_check()
+        self.eval_cp = self._eval_from_human_perspective()
+        self.latest_from = ''
+        self.latest_to = ''
+        self.latest_message = '이전 수로 되돌렸습니다'
+
+    def undo_last_turn(self) -> tuple[bool, str]:
+        if self.game_phase == 'finished':
+            return False, '게임이 종료되었습니다'
+        if self.bot_status in ('thinking', 'moving'):
+            return False, '봇이 동작 중입니다. 잠시 후 다시 시도하세요.'
+        if not self._undo_snapshots:
+            return False, '되돌릴 수가 없습니다'
+
+        try:
+            target, specs = build_undo_moves_payload(
+                self._undo_snapshots,
+                current_fen=self.latest_fen,
+                current_robot_gy=self.graveyard_slots,
+                current_human_gy=self.human_graveyard_slots,
+                robot_side=robot_graveyard_side(self._human_color()),
+                human_side=human_graveyard_side(self._human_color()),
+            )
+        except ValueError as exc:
+            return False, str(exc)
+
+        undo_count = len(specs)
+        request = UndoMoves.Request()
+        request.moves_json = json.dumps(specs)
+        result, err = self._call_service(self.robot_undo_client, request, timeout_sec=180.0)
+        if result is None:
+            return False, err or 'undo service unavailable'
+        if not result.success:
+            return False, result.message or 'undo physical failed'
+
+        self._apply_undo_snapshot(target)
+        self._undo_snapshots = self._undo_snapshots[:-undo_count]
+
+        logical_ok, logical_msg = self._sync_logical_board(self.latest_fen)
+        if not logical_ok:
+            self.get_logger().warn(f'vision sync after undo failed: {logical_msg}')
+        sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+        if not sync_ok:
+            self.get_logger().warn(f'robot sync after undo failed: {sync_msg}')
+
+        self._persist_game_state()
+        return True, self.latest_message
+
+    def revert_illegal_move(self, from_sq: str, to_sq: str) -> tuple[bool, str]:
+        if self.game_phase == 'finished':
+            return False, '게임이 종료되었습니다'
+        if self.bot_status in ('thinking', 'moving'):
+            return False, '봇이 동작 중입니다. 잠시 후 다시 시도하세요.'
+
+        from_sq = from_sq.strip().lower()
+        to_sq = to_sq.strip().lower()
+        if len(from_sq) != 2 or len(to_sq) != 2:
+            return False, '잘못된 칸 좌표입니다'
+
+        fen_before = self.latest_fen
+        board = chess.Board(fen_before)
+        try:
+            to_square = chess.parse_square(to_sq)
+        except ValueError:
+            return False, f'잘못된 목적 칸: {to_sq}'
+
+        graveyard_pick = None
+        captured = board.piece_at(to_square)
+        if captured is not None:
+            graveyard_pick = find_graveyard_slot_for_symbol(
+                self.human_graveyard_slots,
+                human_graveyard_side(self._human_color()),
+                captured.symbol(),
+            )
+
+        payload = [
+            {
+                'mode': 'physical',
+                'fen_before': fen_before,
+                'from_square': from_sq,
+                'to_square': to_sq,
+                'graveyard_pick': graveyard_pick,
+            }
+        ]
+        request = UndoMoves.Request()
+        request.moves_json = json.dumps(payload)
+
+        self.bot_status = 'moving'
+        self.latest_message = f'불법 수 되돌리는 중: {to_sq} → {from_sq}'
+        result, err = self._call_service(self.robot_undo_client, request, timeout_sec=180.0)
+        if result is None:
+            self.bot_status = 'error'
+            return False, err or 'undo service unavailable'
+        if not result.success:
+            self.bot_status = 'error'
+            return False, result.message or 'physical revert failed'
+
+        if graveyard_pick:
+            idx = graveyard_slot_index(
+                int(graveyard_pick['col']),
+                int(graveyard_pick['grave_row']),
+            )
+            symbol = self.human_graveyard_slots[idx]
+            self.human_graveyard_slots[idx] = None
+            if symbol and symbol in self.human_captures:
+                self.human_captures.remove(symbol)
+
+        logical_ok, logical_msg = self._sync_logical_board(fen_before)
+        if not logical_ok:
+            self.get_logger().warn(f'vision sync after illegal revert failed: {logical_msg}')
+        sync_ok, sync_msg = self._sync_robot_board(fen_before)
+        if not sync_ok:
+            self.get_logger().warn(f'robot sync after illegal revert failed: {sync_msg}')
+
+        self._pending_illegal_move = None
+        self.latest_from = ''
+        self.latest_to = ''
+        self.bot_status = 'idle'
+        self._set_bot_banter(react_to_illegal_move_reverted(self._difficulty()))
+        self.latest_message = self.bot_message
         self._spin_for_updates()
         self._persist_game_state()
         return True, self.latest_message
@@ -1209,6 +1485,7 @@ class WebBridgeNode(Node):
             )
             return False, 'logical board update failed after physical move'
 
+        self._push_undo_snapshot(fen_before, legal, by_robot=True)
         self._record_capture(fen_before, legal, by_robot=True)
         self._mark_bot_move_metadata(legal)
         self._process_bot_move_feedback(fen_before, legal)
@@ -1245,6 +1522,151 @@ class WebBridgeNode(Node):
         self.latest_from = legal[:2]
         self.latest_to = legal[2:4]
         return True, physical_msg
+
+    def execute_voice_player_move(self, transcript: str) -> dict[str, Any]:
+        transcript = (transcript or '').strip()
+        base: dict[str, Any] = {
+            'success': False,
+            'message': '',
+            'from': '',
+            'to': '',
+            'transcript': transcript,
+            'parse_error': False,
+            'promotion_required': False,
+        }
+
+        if self.game_phase == 'finished':
+            base['message'] = '게임이 종료되었습니다'
+            return base
+
+        if self.bot_status in ('thinking', 'moving'):
+            raise RuntimeError('봇이 동작 중입니다. 잠시 후 다시 시도하세요.')
+
+        if self._is_robot_turn(self.latest_white_to_move):
+            base['message'] = '지금은 당신 차례가 아닙니다'
+            self.latest_message = base['message']
+            return base
+
+        if not transcript:
+            self._set_bot_banter(react_to_voice_empty(self._difficulty()))
+            base['message'] = self.bot_message
+            self.latest_message = base['message']
+            self._persist_game_state()
+            return base
+
+        parsed = parse_voice_move(transcript)
+        if isinstance(parsed, VoiceMoveParseError):
+            self._set_bot_banter(react_to_voice_parse_error(self._difficulty()))
+            base['parse_error'] = True
+            base['message'] = self.bot_message
+            self.latest_message = base['message']
+            self._persist_game_state()
+            return base
+
+        move = parsed.move
+        from_sq = move.from_sq
+        to_sq = move.to_sq
+        base['from'] = from_sq
+        base['to'] = to_sq
+
+        fen_before = self.latest_fen
+        legal, promo_required, resolve_msg = resolve_voice_move(fen_before, move)
+
+        if promo_required:
+            self._pending_promotion = {
+                'from': from_sq,
+                'to': to_sq,
+                'fen_before': fen_before,
+            }
+            self._set_bot_banter(react_to_voice_promotion_required(self._difficulty()))
+            base['promotion_required'] = True
+            base['message'] = self.bot_message
+            self.latest_message = base['message']
+            self.latest_from = from_sq
+            self.latest_to = to_sq
+            self._persist_game_state()
+            return base
+
+        if legal is None:
+            self._set_bot_banter(
+                react_to_voice_illegal(self._difficulty(), from_sq=from_sq, to_sq=to_sq)
+            )
+            base['message'] = self.bot_message or resolve_msg
+            self.latest_message = base['message']
+            self._persist_game_state()
+            return base
+
+        self._pending_promotion = None
+        self._pending_illegal_move = None
+        self._ensure_active_game()
+
+        try:
+            self._push_undo_snapshot(fen_before, legal, by_robot=False)
+            self._record_capture(fen_before, legal, by_robot=False)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'voice move capture/snapshot failed: {exc}')
+
+        sync_ok, sync_msg = self._sync_robot_board(fen_before)
+        if not sync_ok:
+            base['message'] = sync_msg
+            self.latest_message = sync_msg
+            return base
+
+        self.bot_status = 'moving'
+        self.latest_message = f'음성 명령 이동 중: {from_sq} → {to_sq}'
+        physical_ok, physical_msg = self._execute_physical_move(legal, fen=fen_before)
+        if not physical_ok:
+            self.bot_status = 'error'
+            base['message'] = physical_msg
+            self.latest_message = f'로봇 이동 실패: {physical_msg}'
+            self._persist_game_state()
+            return base
+
+        board = chess.Board(fen_before)
+        board.push_uci(legal)
+        fen_after = board.fen()
+
+        logical_ok, logical_msg = self._sync_logical_board(fen_after)
+        if not logical_ok:
+            self.get_logger().warn(f'vision sync after voice move failed: {logical_msg}')
+            if not self._push_local_fen_move(legal, fen=fen_before):
+                self.bot_status = 'error'
+                base['message'] = '보드 상태 반영 실패'
+                self.latest_message = base['message']
+                self._persist_game_state()
+                return base
+
+        self.latest_from = legal[:2]
+        self.latest_to = legal[2:4]
+        self.bot_status = 'idle'
+
+        try:
+            self._process_player_move_feedback(fen_before, legal)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'voice move feedback failed: {exc}')
+
+        promo = legal[4:5] if len(legal) > 4 else ''
+        if promo:
+            self.promotion_notice = promotion_notice(legal[:2], legal[2:4], promo)
+
+        sync_ok, sync_msg = self._sync_robot_board(fen_after)
+        if not sync_ok:
+            self.get_logger().warn(f'robot sync after voice move failed: {sync_msg}')
+
+        self._set_bot_banter(
+            react_to_voice_success(self._difficulty(), from_sq=from_sq, to_sq=to_sq)
+        )
+        self._update_game_over_state(fen_after)
+        self.is_check = chess.Board(fen_after).is_check()
+        if self.game_phase != 'finished':
+            self._maybe_play_bot_move(fen_after)
+
+        base['success'] = True
+        base['message'] = self.bot_message
+        self.latest_message = base['message']
+        self._spin_for_updates()
+        self._persist_game_state()
+        return base
 
 
 def create_app(node: WebBridgeNode) -> FastAPI:
@@ -1291,6 +1713,16 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             raise HTTPException(status_code=400, detail=message)
         return {'success': success, 'message': message, **node.get_board_payload()}
 
+    @app.post('/api/undo')
+    def undo() -> dict[str, Any]:
+        try:
+            success, message = node.undo_last_turn()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
+
     @app.post('/api/player-moved')
     def player_moved() -> dict[str, Any]:
         success, message, from_sq, to_sq = node.confirm_player_move()
@@ -1301,7 +1733,17 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             'to': to_sq,
             **node.get_board_payload(),
         }
+        if node._pending_illegal_move:
+            payload['illegal_move'] = True
         return payload
+
+    @app.post('/api/voice-move')
+    def voice_move(req: VoiceMoveRequest) -> dict[str, Any]:
+        try:
+            result = node.execute_voice_player_move(req.transcript)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {**result, **node.get_board_payload()}
 
     @app.post('/api/move')
     def post_move(req: MoveRequest) -> dict[str, Any]:
@@ -1342,6 +1784,16 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
+
+    @app.post('/api/revert-illegal-move')
+    def revert_illegal_move(req: RevertIllegalMoveRequest) -> dict[str, Any]:
+        try:
+            success, message = node.revert_illegal_move(req.from_square, req.to)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not success:

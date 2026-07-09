@@ -1,0 +1,9 @@
+# Newest-first list of moves to reverse physically.
+# JSON array of objects:
+#   fen_before: string
+#   uci: string
+#   graveyard_pick: optional {side, col, grave_row, symbol}
+string moves_json
+---
+bool success
+string message

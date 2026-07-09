@@ -7,7 +7,15 @@ from dataclasses import dataclass
 from typing import Literal
 
 Difficulty = Literal['easy', 'medium', 'hard']
-BanterKind = Literal['greeting', 'game_over', 'check', 'capture', 'move']
+BanterKind = Literal[
+    'greeting',
+    'game_over',
+    'check',
+    'capture',
+    'move',
+    'illegal_move',
+    'voice_move',
+]
 
 
 @dataclass(frozen=True)
@@ -120,6 +128,55 @@ def react_to_game_over(
     if result == 'resign':
         return BanterLine('기권하셨군요. 이번 판은 제 승리입니다.', 'game_over')
     return BanterLine('무승부로 게임이 끝났습니다.', 'game_over')
+
+
+def react_to_illegal_move(
+    difficulty: Difficulty,
+    *,
+    from_sq: str,
+    to_sq: str,
+) -> BanterLine:
+    del difficulty, from_sq, to_sq
+    return BanterLine(
+        '그 수는 규칙에 어긋나요. 보드 수정 또는 자동 되돌리기를 선택하세요.',
+        'illegal_move',
+    )
+
+
+def react_to_illegal_move_reverted(difficulty: Difficulty) -> BanterLine:
+    del difficulty
+    return BanterLine('수를 되돌렸습니다. 다시 두세요.', 'illegal_move')
+
+
+def react_to_voice_parse_error(difficulty: Difficulty) -> BanterLine:
+    del difficulty
+    return BanterLine(
+        '명령을 이해하지 못했습니다. a2 a3처럼 출발 칸과 도착 칸을 말해주세요.',
+        'voice_move',
+    )
+
+
+def react_to_voice_illegal(difficulty: Difficulty, *, from_sq: str, to_sq: str) -> BanterLine:
+    del difficulty
+    return BanterLine(f'불법 수입니다. {from_sq}에서 {to_sq}로 둘 수 없습니다.', 'voice_move')
+
+
+def react_to_voice_success(difficulty: Difficulty, *, from_sq: str, to_sq: str) -> BanterLine:
+    del difficulty
+    return BanterLine(f'{from_sq}에서 {to_sq}로 옮겼습니다.', 'voice_move')
+
+
+def react_to_voice_empty(difficulty: Difficulty) -> BanterLine:
+    del difficulty
+    return BanterLine('음성이 인식되지 않았습니다. 다시 말해주세요.', 'voice_move')
+
+
+def react_to_voice_promotion_required(difficulty: Difficulty) -> BanterLine:
+    del difficulty
+    return BanterLine(
+        '승격이 필요합니다. 퀸, 룩, 비숍, 나이트 중 하나를 말해주세요.',
+        'voice_move',
+    )
 
 
 def react_to_bot_move(difficulty: Difficulty, *, is_capture: bool, is_check: bool) -> BanterLine:

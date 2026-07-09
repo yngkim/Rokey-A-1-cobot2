@@ -20,6 +20,10 @@ tsconfig.tsbuildinfo
 .idea/
 .vscode/
 .cursor/rules/
+docs/
+scripts/agent_status.sh
+scripts/setup_cursor_rules.sh
+scripts/sync_legacy_workspaces.sh
 *.swp
 .DS_Store
 

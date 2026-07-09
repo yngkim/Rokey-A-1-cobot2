@@ -69,17 +69,22 @@ class ZFirstMotionPlanner:
     def _ori_from(self, pose_map: SquarePoseMap | None) -> list[float]:
         return self._pmap(pose_map).fixed_orientation
 
+    def _travel_z(self, pose_map: SquarePoseMap | None) -> float:
+        pmap = self._pmap(pose_map)
+        extra = float(getattr(pmap, 'travel_extra_mm', 0.0))
+        return pmap.z_travel_mm + extra
+
     def ensure_travel_height(self, pose_map: SquarePoseMap | None = None) -> None:
         """Keep XY, raise/maintain Z at travel height."""
         pmap = self._pmap(pose_map)
         cur_x, cur_y, _ = self._current_xyz()
-        self._move([cur_x, cur_y, pmap.z_travel_mm, *pmap.fixed_orientation])
+        self._move([cur_x, cur_y, self._travel_z(pose_map), *pmap.fixed_orientation])
 
     def move_xy_at_travel(self, col: int, row: int, pose_map: SquarePoseMap | None = None) -> None:
         """Move XY at travel Z (Z unchanged)."""
         pmap = self._pmap(pose_map)
         target_x, target_y = pmap.square_center_xy(col, row)
-        self._move([target_x, target_y, pmap.z_travel_mm, *pmap.fixed_orientation])
+        self._move([target_x, target_y, self._travel_z(pose_map), *pmap.fixed_orientation])
 
     def _descend_to_z(
         self,
@@ -133,14 +138,15 @@ class ZFirstMotionPlanner:
         """Lift Z back to travel height at current XY."""
         pmap = self._pmap(pose_map)
         cur_x, cur_y, _ = self._current_xyz()
+        travel_z = self._travel_z(pose_map)
         if slow:
             self._move(
-                [cur_x, cur_y, pmap.z_travel_mm, *pmap.fixed_orientation],
+                [cur_x, cur_y, travel_z, *pmap.fixed_orientation],
                 vel=self.retreat_velocity,
                 acc=self.retreat_acceleration,
             )
         else:
-            self._move([cur_x, cur_y, pmap.z_travel_mm, *pmap.fixed_orientation])
+            self._move([cur_x, cur_y, travel_z, *pmap.fixed_orientation])
 
     def pick_and_place_path(
         self,

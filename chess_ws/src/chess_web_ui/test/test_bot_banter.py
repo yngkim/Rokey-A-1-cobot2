@@ -4,7 +4,12 @@ from chess_web_ui.bot_banter import (
     greeting,
     react_to_bot_move,
     react_to_game_over,
+    react_to_illegal_move,
+    react_to_illegal_move_reverted,
     react_to_player_move,
+    react_to_voice_illegal,
+    react_to_voice_parse_error,
+    react_to_voice_success,
 )
 
 
@@ -72,3 +77,33 @@ def test_bot_move_capture_easy():
 def test_bot_move_routine():
     line = react_to_bot_move('hard', is_capture=False, is_check=False)
     assert line.kind == 'move'
+
+
+def test_illegal_move_kind():
+    line = react_to_illegal_move('medium', from_sq='e2', to_sq='c4')
+    assert line.kind == 'illegal_move'
+    assert '규칙' in line.text
+
+
+def test_illegal_move_reverted_kind():
+    line = react_to_illegal_move_reverted('easy')
+    assert line.kind == 'illegal_move'
+    assert '되돌렸습니다' in line.text
+
+
+def test_voice_move_parse_error_kind():
+    line = react_to_voice_parse_error('medium')
+    assert line.kind == 'voice_move'
+    assert 'a2 a3' in line.text
+
+
+def test_voice_move_success_kind():
+    line = react_to_voice_success('easy', from_sq='e2', to_sq='e4')
+    assert line.kind == 'voice_move'
+    assert 'e2' in line.text
+
+
+def test_voice_move_illegal_kind():
+    line = react_to_voice_illegal('hard', from_sq='e2', to_sq='e5')
+    assert line.kind == 'voice_move'
+    assert '불법' in line.text

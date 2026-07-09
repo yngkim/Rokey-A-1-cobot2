@@ -32,7 +32,14 @@ export type GameResult =
   | 'resign'
   | '';
 
-export type BotSpeechKind = 'greeting' | 'game_over' | 'check' | 'capture' | 'move';
+export type BotSpeechKind =
+  | 'greeting'
+  | 'game_over'
+  | 'check'
+  | 'capture'
+  | 'move'
+  | 'illegal_move'
+  | 'voice_move';
 
 export type BoardResponse = {
   fen: string;
@@ -63,7 +70,11 @@ export type BoardResponse = {
   game_id?: string;
   graveyard_slots?: (string | null)[];
   human_graveyard_slots?: (string | null)[];
+  undo_available?: boolean;
   promotion_required?: boolean;
+  illegal_move?: boolean;
+  parse_error?: boolean;
+  transcript?: string;
 };
 
 const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
@@ -300,6 +311,35 @@ export async function postResign(): Promise<BoardResponse> {
   const res = await fetch('/api/resign', { method: 'POST' });
   const data = await readBoardResponse(res);
   if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'resign failed');
+  return data;
+}
+
+export async function postUndo(): Promise<BoardResponse> {
+  const res = await fetch('/api/undo', { method: 'POST' });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'undo failed');
+  return data;
+}
+
+export async function postRevertIllegalMove(from: string, to: string): Promise<BoardResponse> {
+  const res = await fetch('/api/revert-illegal-move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ from, to }),
+  });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'revert failed');
+  return data;
+}
+
+export async function postVoiceMove(transcript: string): Promise<BoardResponse> {
+  const res = await fetch('/api/voice-move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcript }),
+  });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'voice move failed');
   return data;
 }
 

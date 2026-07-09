@@ -9,14 +9,19 @@ import {
   postPlayerPromote,
   postBoardCorrect,
   postResign,
+  postRevertIllegalMove,
+  postUndo,
+  postVoiceMove,
   resetBoard,
   restoreBoard,
 } from './chess';
 import { useBotTts } from './hooks/useBotTts';
+import { useVoiceCommand } from './hooks/useVoiceCommand';
 import { loadUserSettings, type UserSettings } from './lib/userSettings';
 import LobbyView from './views/LobbyView';
 import GameView from './views/GameView';
 import PromotionModal from './components/PromotionModal';
+import IllegalMoveModal from './components/IllegalMoveModal';
 import './styles/chess-theme.css';
 
 export default function App() {
@@ -32,6 +37,12 @@ export default function App() {
   const [pendingPromotion, setPendingPromotion] = useState<{ from: string; to: string } | null>(
     null,
   );
+  const [pendingIllegalMove, setPendingIllegalMove] = useState<{ from: string; to: string } | null>(
+    null,
+  );
+  const [boardEditRequest, setBoardEditRequest] = useState(0);
+  const { state: voiceState, interimTranscript, startListening } = useVoiceCommand();
+  const voiceListening = voiceState === 'listening' || voiceState === 'processing';
 
   useBotTts(board, {
     enabled: screen === 'game',
@@ -85,10 +96,15 @@ export default function App() {
     try {
       const data = await postPlayerMoved();
       setBoard(data);
-      if (data.promotion_required && data.from && data.to) {
+      if (data.illegal_move && data.from && data.to) {
+        setPendingIllegalMove({ from: data.from, to: data.to });
+        setPendingPromotion(null);
+      } else if (data.promotion_required && data.from && data.to) {
         setPendingPromotion({ from: data.from, to: data.to });
+        setPendingIllegalMove(null);
       } else {
         setPendingPromotion(null);
+        setPendingIllegalMove(null);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : '수 감지 실패');
@@ -181,6 +197,62 @@ export default function App() {
     }
   };
 
+  const handleUndo = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postUndo();
+      setBoard(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Undo 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleIllegalAutoRevert = async () => {
+    if (!pendingIllegalMove) return;
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postRevertIllegalMove(
+        pendingIllegalMove.from,
+        pendingIllegalMove.to,
+      );
+      setBoard(data);
+      setPendingIllegalMove(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '자동 되돌리기 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleIllegalBoardEdit = () => {
+    setPendingIllegalMove(null);
+    setBoardEditRequest((n) => n + 1);
+  };
+
+  const handleVoiceMove = async () => {
+    setError('');
+    try {
+      const transcript = await startListening(5000);
+      setBusy(true);
+      const data = await postVoiceMove(transcript);
+      setBoard(data);
+      if (data.promotion_required && data.from && data.to) {
+        setPendingPromotion({ from: data.from, to: data.to });
+      }
+      if (!data.success && !data.parse_error) {
+        setError(data.message || '음성 명령 처리 실패');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '음성 명령 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       {error ? (
@@ -210,7 +282,12 @@ export default function App() {
           onRestore={handleRestore}
           onBackToLobby={handleBackToLobby}
           onResign={handleResign}
+          onUndo={handleUndo}
+          onVoiceMove={handleVoiceMove}
+          voiceListening={voiceListening}
+          voiceInterimText={interimTranscript}
           onBoardCorrect={handleBoardCorrect}
+          boardEditRequest={boardEditRequest}
         />
       ) : (
         <p style={{ textAlign: 'center', color: '#9a9a9a' }}>로딩 중…</p>
@@ -223,6 +300,16 @@ export default function App() {
           busy={busy}
           onPick={handlePromotionPick}
           onCancel={() => setPendingPromotion(null)}
+        />
+      ) : null}
+      {pendingIllegalMove ? (
+        <IllegalMoveModal
+          fromSquare={pendingIllegalMove.from}
+          toSquare={pendingIllegalMove.to}
+          busy={busy}
+          onBoardEdit={handleIllegalBoardEdit}
+          onAutoRevert={handleIllegalAutoRevert}
+          onCancel={() => setPendingIllegalMove(null)}
         />
       ) : null}
     </div>

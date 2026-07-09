@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 
 import rclpy
 from chess_msgs.action import ExecuteMove, RestoreBoard
 from chess_msgs.msg import BoardOccupancy, BoardState, GameSnapshot
-from chess_msgs.srv import ResetBoard, RetreatArm, MoveToObserve, SetBoard
+from chess_msgs.srv import ResetBoard, RetreatArm, MoveToObserve, SetBoard, UndoMoves
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -22,6 +23,7 @@ from chess_robot_motion.graveyard_pose_map import GraveyardPoseMap, graveyard_sl
 from chess_robot_motion.graveyard_state import GraveyardState
 from chess_robot_motion.motion_planner import ZFirstMotionPlanner
 from chess_robot_motion.square_pose_map import CalibratedSquarePoseMap, SquareCoord
+from chess_robot_motion.undo_move import UndoStep, plan_reverse_physical, plan_reverse_uci
 from chess_pick_place.dsr_bootstrap import DsrApi, bootstrap_dsr, read_robot_ids_from_node
 from chess_pick_place.restore_board import apply_restore_move_to_state, board_needs_restore, plan_board_restore
 
@@ -86,6 +88,7 @@ class DoosanPickPlaceNode(Node):
         self.create_service(SetBoard, 'robot/set_board', self.handle_set_board, callback_group=group)
         self.create_service(MoveToObserve, 'robot/move_to_observe', self.handle_observe, callback_group=group)
         self.create_service(RetreatArm, 'robot/retreat_arm', self.handle_retreat, callback_group=group)
+        self.create_service(UndoMoves, 'robot/undo_moves', self.handle_undo_moves, callback_group=group)
         self._action_server = ActionServer(
             self,
             ExecuteMove,
@@ -341,6 +344,93 @@ class DoosanPickPlaceNode(Node):
             response.success = False
             response.message = str(exc)
         return response
+
+    def _graveyard_for_side(self, side: str) -> GraveyardState:
+        side = side.strip().lower()
+        if side == self._robot_color():
+            return self.robot_graveyard
+        if side == self._human_graveyard_side():
+            return self.human_graveyard
+        raise RuntimeError(f'unknown graveyard side {side!r}')
+
+    def _execute_undo_step(self, step: UndoStep) -> None:
+        self._open_gripper()
+        if step.kind == 'board_to_board':
+            self.motion.pick_piece_at(step.from_col, step.from_row, self._close_gripper)
+            self.motion.place_piece_at(step.to_col, step.to_row, self._open_gripper)
+            symbol = self.board.remove_piece_at(step.from_col, step.from_row)
+            if symbol is not None:
+                self.board.put_piece_at(step.to_col, step.to_row, symbol)
+            return
+
+        if step.kind == 'graveyard_to_board':
+            if not step.graveyard_side:
+                raise RuntimeError('graveyard_to_board step missing graveyard_side')
+            gy = self._graveyard_for_side(step.graveyard_side)
+            pose_map = self._graveyard_pose_map_for(step.graveyard_side)
+            self.motion.pick_piece_at(
+                step.from_col,
+                step.from_row,
+                self._close_gripper,
+                pose_map=pose_map,
+            )
+            self.motion.ensure_travel_height(self.pose_map)
+            self.motion.place_piece_at(
+                step.to_col,
+                step.to_row,
+                self._open_gripper,
+                pose_map=self.pose_map,
+            )
+            symbol = gy.remove_piece(step.from_col, step.from_row)
+            self.board.put_piece_at(step.to_col, step.to_row, symbol)
+            return
+
+        raise ValueError(f'unknown undo step kind: {step.kind}')
+
+    def handle_undo_moves(self, request, response):
+        try:
+            moves = json.loads(request.moves_json or '[]')
+            if not isinstance(moves, list) or not moves:
+                response.success = False
+                response.message = 'empty undo moves_json'
+                return response
+
+            for entry in moves:
+                fen_before = str(entry.get('fen_before', '')).strip()
+                pick = entry.get('graveyard_pick')
+                if pick is not None and pick.get('side'):
+                    self._ensure_graveyard_calibrated(str(pick['side']), return_home=False)
+                mode = str(entry.get('mode', 'uci')).strip().lower()
+                if mode == 'physical':
+                    from_sq = str(entry.get('from_square', '')).strip()
+                    to_sq = str(entry.get('to_square', '')).strip()
+                    steps = plan_reverse_physical(
+                        fen_before,
+                        from_sq,
+                        to_sq,
+                        graveyard_pick=pick,
+                    )
+                    label = f'physical {from_sq}->{to_sq}'
+                else:
+                    uci = str(entry.get('uci', '')).strip()
+                    steps = plan_reverse_uci(fen_before, uci, graveyard_pick=pick)
+                    label = uci
+                self.get_logger().info(f'undo {label}: {len(steps)} steps')
+                for step in steps:
+                    self._execute_undo_step(step)
+
+            oldest = moves[-1]
+            self.board.set_fen(str(oldest.get('fen_before', '')).strip())
+            self._go_home()
+            self._publish_board_state('undo moves completed')
+            response.success = True
+            response.message = f'undid {len(moves)} move(s)'
+            return response
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'undo moves failed: {exc}')
+            response.success = False
+            response.message = str(exc)
+            return response
 
     def handle_observe(self, request, response):
         del request

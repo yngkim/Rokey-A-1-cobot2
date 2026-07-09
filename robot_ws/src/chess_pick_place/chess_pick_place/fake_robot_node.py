@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import chess
 import rclpy
 from chess_msgs.action import ExecuteMove, RestoreBoard
 from chess_msgs.msg import BoardOccupancy, BoardState, GameSnapshot
-from chess_msgs.srv import MoveToObserve, ResetBoard, RetreatArm, SetBoard
+from chess_msgs.srv import MoveToObserve, ResetBoard, RetreatArm, SetBoard, UndoMoves
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -20,6 +21,7 @@ from chess_robot_motion.board_state_manager import BoardStateManager
 from chess_robot_motion.graveyard_pose_map import graveyard_slot_name
 from chess_robot_motion.graveyard_state import GraveyardState
 from chess_robot_motion.move_physics import captured_piece_symbol
+from chess_robot_motion.undo_move import UndoStep, plan_reverse_physical, plan_reverse_uci
 from chess_pick_place.restore_board import apply_restore_move_to_state, board_needs_restore, plan_board_restore
 
 
@@ -44,6 +46,7 @@ class FakeRobotNode(Node):
         self.create_service(SetBoard, 'robot/set_board', self.handle_set_board, callback_group=group)
         self.create_service(MoveToObserve, 'robot/move_to_observe', self.handle_observe, callback_group=group)
         self.create_service(RetreatArm, 'robot/retreat_arm', self.handle_retreat, callback_group=group)
+        self.create_service(UndoMoves, 'robot/undo_moves', self.handle_undo_moves, callback_group=group)
         self._action_server = ActionServer(
             self,
             ExecuteMove,
@@ -155,6 +158,70 @@ class FakeRobotNode(Node):
             response.success = False
             response.message = str(exc)
         return response
+
+    def _graveyard_for_side(self, side: str) -> GraveyardState:
+        side = side.strip().lower()
+        if side == self._robot_color():
+            return self.robot_graveyard
+        if side == self._human_graveyard_side():
+            return self.human_graveyard
+        raise RuntimeError(f'unknown graveyard side {side!r}')
+
+    def _execute_undo_step_stub(self, step: UndoStep) -> None:
+        if step.kind == 'board_to_board':
+            symbol = self.board.remove_piece_at(step.from_col, step.from_row)
+            if symbol is not None:
+                self.board.put_piece_at(step.to_col, step.to_row, symbol)
+            return
+        if step.kind == 'graveyard_to_board':
+            if not step.graveyard_side:
+                raise RuntimeError('graveyard_to_board step missing graveyard_side')
+            gy = self._graveyard_for_side(step.graveyard_side)
+            symbol = gy.remove_piece(step.from_col, step.from_row)
+            self.board.put_piece_at(step.to_col, step.to_row, symbol)
+            return
+        raise ValueError(f'unknown undo step kind: {step.kind}')
+
+    def handle_undo_moves(self, request, response):
+        try:
+            moves = json.loads(request.moves_json or '[]')
+            if not isinstance(moves, list) or not moves:
+                response.success = False
+                response.message = 'empty undo moves_json'
+                return response
+            for entry in moves:
+                fen_before = str(entry.get('fen_before', '')).strip()
+                pick = entry.get('graveyard_pick')
+                mode = str(entry.get('mode', 'uci')).strip().lower()
+                if mode == 'physical':
+                    from_sq = str(entry.get('from_square', '')).strip()
+                    to_sq = str(entry.get('to_square', '')).strip()
+                    steps = plan_reverse_physical(
+                        fen_before,
+                        from_sq,
+                        to_sq,
+                        graveyard_pick=pick,
+                    )
+                    label = f'physical {from_sq}->{to_sq}'
+                else:
+                    uci = str(entry.get('uci', '')).strip()
+                    steps = plan_reverse_uci(fen_before, uci, graveyard_pick=pick)
+                    label = uci
+                self.get_logger().info(f'undo {label}: {len(steps)} steps (stub)')
+                for step in steps:
+                    self._execute_undo_step_stub(step)
+                time.sleep(0.02)
+            oldest = moves[-1]
+            self.board.set_fen(str(oldest.get('fen_before', '')).strip())
+            self._publish_board_state('undo moves completed (stub)')
+            response.success = True
+            response.message = f'undid {len(moves)} move(s) stub'
+            return response
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f'undo moves failed: {exc}')
+            response.success = False
+            response.message = str(exc)
+            return response
 
     def handle_observe(self, request, response):
         del request

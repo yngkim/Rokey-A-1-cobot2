@@ -196,6 +196,9 @@ class VisionSession:
                     'correct the board or try again'
                 ),
                 cells=list(filtered),
+                from_square=diff.from_square,
+                to_square=diff.to_square,
+                uci=f'{diff.from_square}{diff.to_square}',
                 fen=fen_before,
             )
 

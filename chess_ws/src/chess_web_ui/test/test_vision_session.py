@@ -168,6 +168,8 @@ def test_illegal_move_rejected() -> None:
     after[26] = True   # c4 (illegal pawn move)
     outcome = session.apply_player_move_scan(after)
     assert not outcome.success
+    assert outcome.from_square == 'e2'
+    assert outcome.to_square == 'c4'
     assert session.game.fen == fen_before
 
 

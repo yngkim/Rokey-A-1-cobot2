@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   BoardResponse,
   HumanColor,
@@ -35,6 +35,10 @@ type Props = {
   onRestore: () => void;
   onBackToLobby: () => void;
   onResign: () => void;
+  onUndo: () => void;
+  onVoiceMove: () => void;
+  voiceListening: boolean;
+  voiceInterimText?: string;
   onBoardCorrect: (
     fen: string,
     graveyards?: {
@@ -42,6 +46,7 @@ type Props = {
       human_graveyard_slots?: (string | null)[];
     },
   ) => Promise<void>;
+  boardEditRequest?: number;
 };
 
 export default function GameView({
@@ -56,7 +61,12 @@ export default function GameView({
   onRestore,
   onBackToLobby,
   onResign,
+  onUndo,
+  onVoiceMove,
+  voiceListening,
+  voiceInterimText,
   onBoardCorrect,
+  boardEditRequest = 0,
 }: Props) {
   const [selectedPly, setSelectedPly] = useState<number | null>(null);
   const [editing, setEditing] = useState(false);
@@ -129,6 +139,13 @@ export default function GameView({
     setSelectedPly(null);
   };
 
+  useEffect(() => {
+    if (boardEditRequest > 0) {
+      startEditing();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [boardEditRequest]);
+
   const cancelEditing = () => {
     setEditing(false);
     setDraftGrid(null);
@@ -192,13 +209,20 @@ export default function GameView({
             onRestore={onRestore}
             onEdit={startEditing}
             onResign={onResign}
+            onUndo={onUndo}
+            onVoiceMove={onVoiceMove}
             confirmDisabled={!humanTurn || botBusy || gameFinished}
             confirmBusy={busy}
+            voiceDisabled={!humanTurn || botBusy || gameFinished || busy}
+            voiceListening={voiceListening}
+            voiceInterimText={voiceInterimText}
             resetDisabled={botBusy || busy}
             restoreDisabled={botBusy || busy}
             restoreBusy={busy}
             editDisabled={botBusy || busy}
             resignDisabled={botBusy || busy || gameFinished}
+            undoDisabled={botBusy || busy || gameFinished || !board.undo_available}
+            undoBusy={busy}
             editing={editing}
           />
           {editing && draftGrid ? (
