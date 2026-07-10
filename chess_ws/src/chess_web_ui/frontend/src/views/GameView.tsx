@@ -15,6 +15,8 @@ import {
 import BoardEditBar from '../components/BoardEditBar';
 import BotPanel from '../components/BotPanel';
 import CameraPanel from '../components/CameraPanel';
+import SideViewPanel from '../components/SideViewPanel';
+import HandViewPanel from '../components/HandViewPanel';
 import CapturedBar from '../components/CapturedBar';
 import ChessBoard from '../components/ChessBoard';
 import ClockConfirmButton from '../components/ClockConfirmButton';
@@ -22,6 +24,7 @@ import EvalBar from '../components/EvalBar';
 import GraveyardEditGrid from '../components/GraveyardEditGrid';
 import GameActionBar from '../components/GameActionBar';
 import MoveList from '../components/MoveList';
+import TwinPanel from '../components/TwinPanel';
 
 type Props = {
   board: BoardResponse;
@@ -37,6 +40,9 @@ type Props = {
   onResign: () => void;
   onUndo: () => void;
   onVoiceMove: () => void;
+  onTwinVerify: () => void;
+  onTwinToggle: (enabled: boolean) => void;
+  onHandAutoConfirmToggle: (enabled: boolean) => void;
   voiceListening: boolean;
   voiceInterimText?: string;
   onBoardCorrect: (
@@ -63,6 +69,9 @@ export default function GameView({
   onResign,
   onUndo,
   onVoiceMove,
+  onTwinVerify,
+  onTwinToggle,
+  onHandAutoConfirmToggle,
   voiceListening,
   voiceInterimText,
   onBoardCorrect,
@@ -129,9 +138,40 @@ export default function GameView({
   const bottomCaptures =
     humanColor === 'white' ? board.human_captures ?? [] : board.robot_captures ?? [];
 
+  const boardFlipped = board.board_orientation === 'flipped';
+  const robotGyGrid = (
+    <GraveyardEditGrid
+      title="로봇 graveyard"
+      side={robotGraveyardSide(humanColor)}
+      slots={draftRobotGraveyard}
+      selectedPiece={selectedPiece}
+      onChange={setDraftRobotGraveyard}
+    />
+  );
+  const humanGyGrid = (
+    <GraveyardEditGrid
+      title="사용자 graveyard"
+      side={humanColor}
+      slots={draftHumanGraveyard}
+      selectedPiece={selectedPiece}
+      onChange={setDraftHumanGraveyard}
+    />
+  );
+
   const startEditing = () => {
     setDraftGrid(cloneBoardGrid(parseFenBoard(board.fen)));
     setDraftWhiteToMove(board.white_to_move ?? true);
+    setDraftRobotGraveyard([...(board.graveyard_slots ?? emptyGraveyard())]);
+    setDraftHumanGraveyard([...(board.human_graveyard_slots ?? emptyGraveyard())]);
+    setSelectedPiece('P');
+    setEditing(true);
+    setSelectedPly(null);
+  };
+
+  const applyTwinCandidate = (fen: string) => {
+    const parts = fen.trim().split(/\s+/);
+    setDraftGrid(cloneBoardGrid(parseFenBoard(fen)));
+    setDraftWhiteToMove(parts[1] !== 'b');
     setDraftRobotGraveyard([...(board.graveyard_slots ?? emptyGraveyard())]);
     setDraftHumanGraveyard([...(board.human_graveyard_slots ?? emptyGraveyard())]);
     setSelectedPiece('P');
@@ -225,6 +265,15 @@ export default function GameView({
             undoBusy={busy}
             editing={editing}
           />
+          <ClockConfirmButton
+            botLabel={profile.name}
+            botTime={botClockText}
+            botActive={!humanTurn}
+            botError={board.bot_status === 'error'}
+            playerLabel="당신"
+            playerTime={playerClockText}
+            playerActive={humanTurn}
+          />
           {editing && draftGrid ? (
             <BoardEditBar
               selectedPiece={selectedPiece}
@@ -240,23 +289,20 @@ export default function GameView({
           ) : null}
           {editing ? (
             <div className="graveyard-edit-row">
-              <GraveyardEditGrid
-                title="로봇 graveyard"
-                side={robotGraveyardSide(humanColor)}
-                slots={draftRobotGraveyard}
-                selectedPiece={selectedPiece}
-                onChange={setDraftRobotGraveyard}
-              />
-              <GraveyardEditGrid
-                title="사용자 graveyard"
-                side={humanColor}
-                slots={draftHumanGraveyard}
-                selectedPiece={selectedPiece}
-                onChange={setDraftHumanGraveyard}
-              />
+              {boardFlipped ? (
+                <>
+                  {humanGyGrid}
+                  {robotGyGrid}
+                </>
+              ) : (
+                <>
+                  {robotGyGrid}
+                  {humanGyGrid}
+                </>
+              )}
             </div>
           ) : null}
-          <CapturedBar pieces={topCaptures} />
+          <CapturedBar pieces={boardFlipped ? bottomCaptures : topCaptures} />
           <ChessBoard
             board={board}
             humanColor={humanColor}
@@ -265,17 +311,22 @@ export default function GameView({
             draftGrid={editing ? draftGrid ?? undefined : undefined}
             onSquareClick={handleSquareClick}
           />
-          <CapturedBar pieces={bottomCaptures} />
-          <CameraPanel cameraTick={cameraTick} />
-          <ClockConfirmButton
-            botLabel={profile.name}
-            botTime={botClockText}
-            botActive={!humanTurn}
-            botError={board.bot_status === 'error'}
-            playerLabel="당신"
-            playerTime={playerClockText}
-            playerActive={humanTurn}
-          />
+          <CapturedBar pieces={boardFlipped ? topCaptures : bottomCaptures} />
+          <div className="vision-stack">
+            <CameraPanel cameraTick={cameraTick} />
+            <SideViewPanel
+              cameraTick={cameraTick}
+              humanColor={humanColor}
+              enabled={
+                (board.twin_runtime_enabled ?? false) || (board.hand_available ?? false)
+              }
+              twinRuntimeEnabled={board.twin_runtime_enabled ?? false}
+            />
+            <HandViewPanel
+              cameraTick={cameraTick}
+              enabled={board.hand_available ?? false}
+            />
+          </div>
         </div>
 
         <aside className="sidebar">
@@ -287,6 +338,18 @@ export default function GameView({
             onToggleTtsMute={onToggleTtsMute}
           />
           <EvalBar evalCp={board.eval_cp ?? 0} humanColor={humanColor} />
+          <TwinPanel
+            report={board.twin_report}
+            runtimeEnabled={board.twin_runtime_enabled ?? false}
+            available={board.twin_available ?? true}
+            handAvailable={board.hand_available ?? false}
+            handAutoConfirmEnabled={board.hand_auto_confirm_enabled ?? false}
+            busy={busy}
+            onVerify={onTwinVerify}
+            onToggleRuntime={onTwinToggle}
+            onToggleHandAutoConfirm={onHandAutoConfirmToggle}
+            onApplyCandidate={applyTwinCandidate}
+          />
           <MoveList
             moves={board.move_history ?? []}
             selectedPly={selectedPly}

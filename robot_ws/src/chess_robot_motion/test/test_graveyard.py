@@ -1,5 +1,9 @@
 """Unit tests for graveyard pose map, state, and FEN piece lookup."""
 
+import os
+
+import yaml
+
 from chess_robot_motion.board_state_manager import BoardStateManager
 from chess_robot_motion.graveyard_pose_map import (
     BLACK_GRAVEYARD_FILL_ORDER,
@@ -36,14 +40,13 @@ def test_graveyard_pose_map_offsets_from_h9():
     assert gmap.square_center_xy(0, 1) == (380.0, 160.0)
 
 
-def test_white_graveyard_pose_map_offsets_from_a0():
+def test_white_graveyard_pose_map_negative_col_step():
+    """Physical white GY: slots advance in -X from a0 anchor."""
     anchor = [100.0, 200.0, 300.0, 1.0, 2.0, 3.0]
-    gmap = GraveyardPoseMap(anchor, col_step_mm=40.0, row_step_mm=40.0, anchor_col=0)
+    gmap = GraveyardPoseMap(anchor, col_step_mm=-40.0, row_step_mm=40.0, anchor_col=0)
     assert gmap.square_center_xy(0, 0) == (100.0, 200.0)
-    assert gmap.square_center_xy(1, 0) == (140.0, 200.0)
-    assert gmap.square_center_xy(7, 0) == (380.0, 200.0)
-    assert gmap.square_center_xy(0, 1) == (100.0, 240.0)
-    assert gmap.square_center_xy(7, 1) == (380.0, 240.0)
+    assert gmap.square_center_xy(1, 0) == (60.0, 200.0)
+    assert gmap.square_center_xy(2, 0) == (20.0, 200.0)
 
 
 def test_graveyard_state_slot_sequence_black():
@@ -66,6 +69,25 @@ def test_graveyard_state_slot_sequence_white():
         state.place_piece(col, row, 'p')
     assert state.next_empty_slot() is None
     assert state.is_full()
+
+
+def test_vision_manual_overlay_white_graveyard_col_step():
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')
+    )
+    overlay_path = os.path.join(
+        repo_root,
+        'robot_ws',
+        'src',
+        'chess_robot_bringup',
+        'config',
+        'vision_manual_robot_params.yaml',
+    )
+    with open(overlay_path, encoding='utf-8') as fh:
+        data = yaml.safe_load(fh)
+    params = data['pick_place_node']['ros__parameters']
+    assert params['white_graveyard_col_step_mm'] == -40.0
+    assert params['white_graveyard_row_step_mm'] == 40.0
 
 
 def test_board_piece_at_from_fen():

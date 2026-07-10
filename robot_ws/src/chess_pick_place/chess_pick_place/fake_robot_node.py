@@ -15,13 +15,21 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header
+
+from chess_robot_motion.safety_gate import SafetyGate
 
 from chess_robot_motion.board_state_manager import BoardStateManager
 from chess_robot_motion.graveyard_pose_map import graveyard_slot_name
 from chess_robot_motion.graveyard_state import GraveyardState
 from chess_robot_motion.move_physics import captured_piece_symbol
+from chess_robot_motion.graveyard_sides import robot_chess_color
 from chess_robot_motion.undo_move import UndoStep, plan_reverse_physical, plan_reverse_uci
+from chess_pick_place.graveyard_sync import (
+    apply_human_color_to_graveyards,
+    default_human_color_from_robot_param,
+    normalize_human_color,
+)
 from chess_pick_place.restore_board import apply_restore_move_to_state, board_needs_restore, plan_board_restore
 
 
@@ -31,13 +39,20 @@ class FakeRobotNode(Node):
         self.declare_parameter('publish_board_state', True)
         self.declare_parameter('home_joints', [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17])
         self.declare_parameter('robot_color', 'black')
+        self.declare_parameter('board_orientation', 'standard')
         self.declare_parameter('graveyard_enabled', True)
-        self.declare_parameter('graveyard_a0_joints', [19.87, 41.8, 56.67, -0.03, 81.53, 19.86])
-        self.declare_parameter('white_graveyard_col_step_mm', 40.0)
-        self.declare_parameter('white_graveyard_row_step_mm', -40.0)
+        self.declare_parameter('graveyard_a0_joints', [20.12, 41.84, 55.64, -0.03, 82.52, 15.62])
+        self.declare_parameter('white_graveyard_col_step_mm', -40.0)
+        self.declare_parameter('white_graveyard_row_step_mm', 40.0)
+        self._human_color_value = default_human_color_from_robot_param(
+            str(self.get_parameter('robot_color').value)
+        )
         self.board = BoardStateManager()
-        self.robot_graveyard = GraveyardState(side=self._robot_color())
-        self.human_graveyard = GraveyardState(side=self._human_graveyard_side())
+        self.robot_graveyard = GraveyardState(side='black')
+        self.human_graveyard = GraveyardState(side='white')
+        self._sync_graveyard_sides()
+        self._safety_gate = SafetyGate()
+        self._at_observe_pose = True
         self.board_pub = self.create_publisher(BoardState, 'chess/board_state', 10)
         self.snapshot_pub = self.create_publisher(GameSnapshot, 'chess/game_snapshot', 10)
 
@@ -47,6 +62,13 @@ class FakeRobotNode(Node):
         self.create_service(MoveToObserve, 'robot/move_to_observe', self.handle_observe, callback_group=group)
         self.create_service(RetreatArm, 'robot/retreat_arm', self.handle_retreat, callback_group=group)
         self.create_service(UndoMoves, 'robot/undo_moves', self.handle_undo_moves, callback_group=group)
+        self.create_subscription(
+            Bool,
+            'chess/hand_in_board',
+            self._on_hand_in_board,
+            10,
+            callback_group=group,
+        )
         self._action_server = ActionServer(
             self,
             ExecuteMove,
@@ -97,11 +119,28 @@ class FakeRobotNode(Node):
         snapshot.game_id = 'manual_test'
         self.snapshot_pub.publish(snapshot)
 
+    def _human_color(self) -> str:
+        return self._human_color_value
+
+    def _sync_graveyard_sides(self) -> None:
+        self._human_color_value = apply_human_color_to_graveyards(
+            self._human_color_value,
+            self.robot_graveyard,
+            self.human_graveyard,
+        )
+
+    def _set_human_color(self, human_color: str) -> None:
+        color = normalize_human_color(human_color)
+        if color is None:
+            return
+        self._human_color_value = color
+        self._sync_graveyard_sides()
+
     def _graveyard_enabled(self) -> bool:
         return bool(self.get_parameter('graveyard_enabled').value)
 
     def _robot_color(self) -> str:
-        return str(self.get_parameter('robot_color').value).strip().lower()
+        return robot_chess_color(self._human_color())
 
     def _use_graveyard_for_capture(self, captured_symbol: str | None) -> bool:
         del captured_symbol
@@ -112,8 +151,15 @@ class FakeRobotNode(Node):
             return captured_symbol
         return 'p' if self._robot_color() == 'white' else 'P'
 
+    def _robot_graveyard_side(self) -> str:
+        from chess_robot_motion.graveyard_sides import robot_graveyard_side
+
+        return robot_graveyard_side(self._human_color())
+
     def _human_graveyard_side(self) -> str:
-        return 'white' if self._robot_color() == 'black' else 'black'
+        from chess_robot_motion.graveyard_sides import human_graveyard_side
+
+        return human_graveyard_side(self._human_color())
 
     def _place_captured_in_graveyard_stub(self, captured_symbol: str) -> None:
         if self.robot_graveyard.is_full():
@@ -122,13 +168,14 @@ class FakeRobotNode(Node):
         if slot is None:
             raise RuntimeError('graveyard full (no empty slot)')
         grave_col, grave_row = slot
-        slot_name = graveyard_slot_name(grave_col, grave_row, side=self._robot_color())
+        slot_name = graveyard_slot_name(grave_col, grave_row, side=self._robot_graveyard_side())
         self.get_logger().info(f'graveyard place {slot_name} ({captured_symbol}) (stub)')
         self.robot_graveyard.place_piece(grave_col, grave_row, captured_symbol)
         self.get_logger().info(f'graveyard state: {self.robot_graveyard.summary()}')
 
     def handle_reset(self, request, response):
         del request
+        self._safety_gate.resume()
         self.board.reset()
         self.robot_graveyard.reset()
         self.human_graveyard.reset()
@@ -151,6 +198,18 @@ class FakeRobotNode(Node):
             human_gy_json = getattr(request, 'human_graveyard_slots_json', '') or ''
             if human_gy_json.strip():
                 self.human_graveyard.load_slots(GraveyardState.slots_from_json(human_gy_json))
+            human_color = getattr(request, 'human_color', '') or ''
+            if human_color.strip():
+                self._set_human_color(human_color)
+            orientation = getattr(request, 'board_orientation', '') or ''
+            if orientation.strip():
+                self.set_parameters([
+                    rclpy.parameter.Parameter(
+                        'board_orientation',
+                        rclpy.parameter.Parameter.Type.STRING,
+                        orientation.strip().lower(),
+                    )
+                ])
             response.success = True
             response.message = 'robot board synced from FEN'
             response.fen = self.board.fen
@@ -161,7 +220,7 @@ class FakeRobotNode(Node):
 
     def _graveyard_for_side(self, side: str) -> GraveyardState:
         side = side.strip().lower()
-        if side == self._robot_color():
+        if side == self._robot_graveyard_side():
             return self.robot_graveyard
         if side == self._human_graveyard_side():
             return self.human_graveyard
@@ -225,8 +284,12 @@ class FakeRobotNode(Node):
 
     def handle_observe(self, request, response):
         del request
-        joints = list(self.get_parameter('home_joints').value)
-        self.get_logger().info(f'Moved to observation pose (stub): {joints}')
+        if self._at_observe_pose:
+            self.get_logger().info('move_to_observe: already at observe/home (stub)')
+        else:
+            joints = list(self.get_parameter('home_joints').value)
+            self.get_logger().info(f'Moved to observation pose (stub): {joints}')
+            self._at_observe_pose = True
         response.success = True
         response.message = 'observation pose reached'
         return response
@@ -246,6 +309,12 @@ class FakeRobotNode(Node):
         del goal_handle
         return CancelResponse.ACCEPT
 
+    def _on_hand_in_board(self, msg: Bool) -> None:
+        if msg.data:
+            self._safety_gate.request_pause()
+        else:
+            self._safety_gate.resume()
+
     def execute_move(self, goal_handle):
         move = goal_handle.request.move
         from_col = int(move.from_square.col)
@@ -263,6 +332,8 @@ class FakeRobotNode(Node):
             result.success = False
             result.message = validation.message
             return result
+
+        self._at_observe_pose = False
 
         is_capture = validation.is_capture
         is_en_passant = validation.is_en_passant or bool(move.is_en_passant)
@@ -300,6 +371,14 @@ class FakeRobotNode(Node):
                 result.success = False
                 result.message = 'canceled'
                 return result
+            try:
+                self._safety_gate.wait_if_paused()
+            except RuntimeError:
+                goal_handle.canceled()
+                result = ExecuteMove.Result()
+                result.success = False
+                result.message = 'canceled'
+                return result
             feedback.progress = progress
             feedback.status = 'moving'
             goal_handle.publish_feedback(feedback)
@@ -312,6 +391,7 @@ class FakeRobotNode(Node):
         result = ExecuteMove.Result()
         result.success = True
         result.message = 'move completed'
+        self._at_observe_pose = True
         return result
 
     def execute_restore_board(self, goal_handle):

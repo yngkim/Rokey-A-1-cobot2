@@ -1,6 +1,7 @@
-export type BotStatus = 'idle' | 'thinking' | 'moving' | 'error';
-export type Difficulty = 'easy' | 'medium' | 'hard';
+export type BotStatus = 'idle' | 'thinking' | 'moving' | 'paused' | 'error';
+export type Difficulty = 'beginner' | 'easy' | 'medium' | 'hard' | 'master';
 export type HumanColor = 'white' | 'black';
+export type BoardOrientation = 'standard' | 'flipped';
 export type GamePhase = 'lobby' | 'playing' | 'finished';
 export type MoveQuality = 'brilliant' | 'good' | 'inaccuracy' | 'mistake' | 'blunder';
 
@@ -51,6 +52,7 @@ export type BoardResponse = {
   white_to_move?: boolean;
   human_color?: HumanColor;
   robot_color?: HumanColor;
+  board_orientation?: BoardOrientation;
   bot_status?: BotStatus;
   last_bot_move?: string;
   auto_bot_move?: boolean;
@@ -75,6 +77,40 @@ export type BoardResponse = {
   illegal_move?: boolean;
   parse_error?: boolean;
   transcript?: string;
+  voice_action?: 'move' | 'confirm' | 'undo' | 'restore' | 'resign' | 'parse_error';
+  parsed_summary?: string;
+  twin_report?: TwinReport;
+  twin_available?: boolean;
+  twin_runtime_enabled?: boolean;
+  hand_available?: boolean;
+  hand_auto_confirm_enabled?: boolean;
+};
+
+export type TwinMismatch = {
+  kind: string;
+  square: string;
+  message: string;
+  recorded_symbol?: string;
+  actual_symbol?: string;
+  evidence?: string;
+  authoritative?: boolean;
+};
+
+export type TwinSuggestion = {
+  kind: string;
+  message: string;
+  candidate_fen?: string;
+  priority?: number;
+};
+
+export type TwinReport = {
+  success: boolean;
+  aligned: boolean;
+  message: string;
+  recorded_fen: string;
+  mismatches?: TwinMismatch[];
+  suggestions?: TwinSuggestion[];
+  scan_message?: string;
 };
 
 const FILES = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
@@ -229,6 +265,87 @@ export function cameraPreviewUrl(cacheBust: number): string {
   return `/api/camera/preview.jpg?t=${cacheBust}`;
 }
 
+export function webcamPreviewUrl(cacheBust: number): string {
+  return `/api/twin/webcam/preview.jpg?t=${cacheBust}`;
+}
+
+export function handPreviewUrl(cacheBust: number): string {
+  return `/api/hand/preview.jpg?t=${cacheBust}`;
+}
+
+export type TwinDetectionView = {
+  class_name: string;
+  symbol?: string;
+  square?: string;
+  confidence?: number;
+  center_x?: number;
+  center_y?: number;
+  bbox?: number[];
+};
+
+export type TwinLiveState = {
+  enabled: boolean;
+  available?: boolean;
+  runtime_enabled?: boolean;
+  recorded_occupancy?: boolean[];
+  sideview_occupancy?: boolean[];
+  sideview_piece_map?: Record<string, string>;
+  sideview_detections?: TwinDetectionView[];
+  diff_squares?: string[];
+  message?: string;
+  preview_available?: boolean;
+  preview_error?: string;
+  sideview_updated_at?: number;
+  preview_updated_at?: number;
+  hand_in_board?: boolean;
+  hand_seen?: boolean;
+  hand_present?: boolean;
+  hand_updated_at?: number;
+  hand_safety_paused?: boolean;
+  hand_auto_confirm_enabled?: boolean;
+  hand_available?: boolean;
+  hand_preview_available?: boolean;
+  hand_preview_error?: string;
+  hand_detection_count?: number;
+};
+
+export type TwinCalibrationState = {
+  calibration_path?: string;
+  board_corners: number[];
+  flip_files: boolean;
+  board_flipped: boolean;
+  webcam_device?: number;
+  camera_width?: number;
+  camera_height?: number;
+};
+
+export async function fetchTwinCalibration(): Promise<TwinCalibrationState> {
+  const res = await fetch('/api/twin/calibration');
+  if (!res.ok) throw new Error('failed to fetch twin calibration');
+  return (await res.json()) as TwinCalibrationState;
+}
+
+export async function postTwinCalibration(payload: {
+  board_corners: number[];
+  flip_files?: boolean;
+  board_flipped?: boolean;
+}): Promise<TwinCalibrationState & TwinLiveState & { success?: boolean; message?: string }> {
+  const res = await fetch('/api/twin/calibration', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'twin calibration save failed');
+  return data as TwinCalibrationState & TwinLiveState & { success?: boolean; message?: string };
+}
+
+export async function fetchTwinLive(): Promise<TwinLiveState> {
+  const res = await fetch('/api/twin/live');
+  if (!res.ok) throw new Error('failed to fetch twin live state');
+  return (await res.json()) as TwinLiveState;
+}
+
 export async function readBoardResponse(res: Response): Promise<BoardResponse> {
   const text = await res.text();
   try {
@@ -247,14 +364,32 @@ export async function fetchBoard(): Promise<BoardResponse> {
 export async function postGameConfig(
   humanColor: HumanColor,
   difficulty: Difficulty,
+  boardOrientation: BoardOrientation = 'standard',
+  handAutoConfirmEnabled?: boolean,
 ): Promise<BoardResponse> {
   const res = await fetch('/api/game/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ human_color: humanColor, difficulty }),
+    body: JSON.stringify({
+      human_color: humanColor,
+      difficulty,
+      board_orientation: boardOrientation,
+      hand_auto_confirm_enabled: handAutoConfirmEnabled,
+    }),
   });
   const data = await readBoardResponse(res);
   if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'game config failed');
+  return data;
+}
+
+export async function postHandConfig(enabled: boolean): Promise<BoardResponse> {
+  const res = await fetch('/api/hand/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ auto_confirm_enabled: enabled }),
+  });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'hand config failed');
   return data;
 }
 
@@ -332,6 +467,34 @@ export async function postRevertIllegalMove(from: string, to: string): Promise<B
   return data;
 }
 
+export async function postTwinVerify(options?: {
+  confirm_failed?: boolean;
+  use_fresh_scan?: boolean;
+}): Promise<BoardResponse> {
+  const res = await fetch('/api/twin/verify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      confirm_failed: options?.confirm_failed ?? false,
+      use_fresh_scan: options?.use_fresh_scan ?? true,
+    }),
+  });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'twin verify failed');
+  return data;
+}
+
+export async function postTwinConfig(enabled: boolean): Promise<BoardResponse> {
+  const res = await fetch('/api/twin/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'twin config failed');
+  return data;
+}
+
 export async function postVoiceMove(transcript: string): Promise<BoardResponse> {
   const res = await fetch('/api/voice-move', {
     method: 'POST',
@@ -376,6 +539,7 @@ export function turnLabel(board: BoardResponse | null): string {
   if (board.is_check) return '체크!';
   if (board.bot_status === 'thinking') return '로봇 생각 중…';
   if (board.bot_status === 'moving') return '로봇 이동 중…';
+  if (board.bot_status === 'paused') return '손 감지 — 로봇 일시정지';
   if (board.bot_status === 'error') return '로봇 오류';
   if (!isHumanTurn(board)) {
     return `차례: ${board.robot_color === 'white' ? '백' : '흑'}(로봇)`;
@@ -389,7 +553,9 @@ export function evalToPercent(evalCp: number): number {
 }
 
 export const DIFFICULTY_LABELS: Record<Difficulty, string> = {
+  beginner: '입문',
   easy: '하',
   medium: '중',
   hard: '상',
+  master: '최상',
 };

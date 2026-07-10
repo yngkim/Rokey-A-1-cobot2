@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Callable, Protocol
+from typing import Any, Callable, Protocol
+
+from chess_robot_motion.safety_gate import SafetyGate
+
+
+class MotionInterrupted(Exception):
+    """Raised when hand safety pause interrupted an in-flight movel."""
 
 
 class SquarePoseMap(Protocol):
@@ -31,11 +37,13 @@ class ZFirstMotionPlanner:
         retreat_velocity: float = 60.0,
         retreat_acceleration: float = 60.0,
         z_approach_offset_mm: float = 25.0,
+        safety_gate: SafetyGate | None = None,
     ) -> None:
         self.pose_map = pose_map
         self.movel = movel
         self.mwait = mwait
         self.get_current_posx = get_current_posx
+        self.safety_gate = safety_gate
         self.velocity = velocity
         self.acceleration = acceleration
         self.pick_velocity = pick_velocity
@@ -53,8 +61,12 @@ class ZFirstMotionPlanner:
         vel: float | None = None,
         acc: float | None = None,
     ) -> None:
+        if self.safety_gate is not None:
+            self.safety_gate.wait_if_paused()
         self.movel(posx, vel=vel if vel is not None else self.velocity, acc=acc if acc is not None else self.acceleration)
         self.mwait()
+        if self.safety_gate is not None and self.safety_gate.consume_interrupted():
+            raise MotionInterrupted('motion interrupted by hand safety pause')
 
     def _current_xyz(self) -> tuple[float, float, float]:
         pos = self.get_current_posx()[0]

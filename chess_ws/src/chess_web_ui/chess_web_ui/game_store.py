@@ -44,6 +44,7 @@ class GameRecord:
     ply_counter: int = 0
     last_bot_move: str = ''
     bot_message: str = ''
+    board_orientation: str = 'standard'
 
     def to_row(self) -> dict[str, Any]:
         return {
@@ -54,6 +55,7 @@ class GameRecord:
             'fen': self.fen,
             'human_color': self.human_color,
             'difficulty': self.difficulty,
+            'board_orientation': self.board_orientation,
             'game_phase': self.game_phase,
             'game_result': self.game_result,
             'winner': self.winner,
@@ -79,6 +81,11 @@ class GameRecord:
             fen=row['fen'],
             human_color=row['human_color'],
             difficulty=row['difficulty'],
+            board_orientation=(
+                row['board_orientation']
+                if 'board_orientation' in row.keys()
+                else 'standard'
+            ),
             game_phase=row['game_phase'],
             game_result=row['game_result'] or '',
             winner=row['winner'] or '',
@@ -153,6 +160,11 @@ class GameStore:
                     "ALTER TABLE games ADD COLUMN human_graveyard_slots_json "
                     "TEXT NOT NULL DEFAULT '[]'"
                 )
+            if 'board_orientation' not in cols:
+                conn.execute(
+                    "ALTER TABLE games ADD COLUMN board_orientation "
+                    "TEXT NOT NULL DEFAULT 'standard'"
+                )
             conn.commit()
 
     def load_active_game(self) -> GameRecord | None:
@@ -200,6 +212,7 @@ class GameStore:
         fen: str = START_FEN,
         human_color: str = 'white',
         difficulty: str = 'medium',
+        board_orientation: str = 'standard',
         game_phase: str = 'playing',
         bot_message: str = '',
     ) -> GameRecord:
@@ -213,6 +226,7 @@ class GameStore:
             fen=fen,
             human_color=human_color,
             difficulty=difficulty,
+            board_orientation=board_orientation,
             game_phase=game_phase,
             game_result='',
             winner='',

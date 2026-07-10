@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
+from enum import Enum
 
 import rclpy
 from chess_msgs.action import ExecuteMove, RestoreBoard
@@ -15,20 +17,44 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Header
+from rclpy.parameter import Parameter
+from std_msgs.msg import Bool, Header
 
 from chess_robot_motion.board_restore_planner import RestoreMove
 from chess_robot_motion.board_state_manager import BoardStateManager
 from chess_robot_motion.graveyard_pose_map import GraveyardPoseMap, graveyard_slot_name
 from chess_robot_motion.graveyard_state import GraveyardState
-from chess_robot_motion.motion_planner import ZFirstMotionPlanner
+from chess_robot_motion.motion_planner import MotionInterrupted, ZFirstMotionPlanner
+from chess_robot_motion.safety_gate import SafetyGate
 from chess_robot_motion.square_pose_map import CalibratedSquarePoseMap, SquareCoord
+from chess_robot_motion.graveyard_sides import robot_chess_color
 from chess_robot_motion.undo_move import UndoStep, plan_reverse_physical, plan_reverse_uci
 from chess_pick_place.dsr_bootstrap import DsrApi, bootstrap_dsr, read_robot_ids_from_node
+from chess_pick_place.graveyard_sync import (
+    apply_human_color_to_graveyards,
+    default_human_color_from_robot_param,
+    normalize_human_color,
+)
 from chess_pick_place.restore_board import apply_restore_move_to_state, board_needs_restore, plan_board_restore
 
 
 from robot_control.onrobot import RG
+
+
+class MotionSegment(str, Enum):
+    NONE = ''
+    TRAVEL_PICK = 'travel_pick'
+    DESCEND_PICK = 'descend_pick'
+    ASCEND_PICK = 'ascend_pick'
+    TRAVEL_PLACE = 'travel_place'
+    DESCEND_PLACE = 'descend_place'
+    ASCEND_PLACE = 'ascend_place'
+    CAPTURE_TRAVEL = 'capture_travel'
+    CAPTURE_DESCEND = 'capture_descend'
+    CAPTURE_ASCEND = 'capture_ascend'
+    GY_TRAVEL = 'gy_travel'
+    GY_DESCEND = 'gy_descend'
+    GY_ASCEND = 'gy_ascend'
 
 
 class DoosanPickPlaceNode(Node):
@@ -40,11 +66,19 @@ class DoosanPickPlaceNode(Node):
         self._movel = dsr_api.movel
         self._mwait = dsr_api.mwait
         self._get_current_posx = dsr_api.get_current_posx
+        self._safety_gate = SafetyGate(move_stop=dsr_api.move_stop)
+        self._motion_segment = MotionSegment.NONE
+        self._segment_ctx: dict = {}
+        self._at_observe_pose = False
         self._init_gripper()
 
+        self._human_color_value = default_human_color_from_robot_param(
+            str(self.get_parameter('robot_color').value)
+        )
         self.board = BoardStateManager()
-        self.robot_graveyard = GraveyardState(side=self._robot_color())
-        self.human_graveyard = GraveyardState(side=self._human_graveyard_side())
+        self.robot_graveyard = GraveyardState(side='black')
+        self.human_graveyard = GraveyardState(side='white')
+        self._sync_graveyard_sides()
         self._graveyard_pose_maps: dict[str, GraveyardPoseMap] = {}
         z_pick = float(self.get_parameter('z_pick_mm').value)
         clearance = float(self.get_parameter('z_travel_clearance_mm').value)
@@ -58,12 +92,14 @@ class DoosanPickPlaceNode(Node):
             z_pick_mm=z_pick,
             z_travel_mm=z_travel,
             fixed_orientation=list(self.get_parameter('fixed_orientation').value),
+            board_flipped=self._board_flipped(),
         )
         self.get_logger().info(
             f'A1 pick pose: xy={self.pose_map.anchor_x},{self.pose_map.anchor_y} '
             f'z_pick={self.pose_map.z_pick_mm} z_travel={self.pose_map.z_travel_mm} '
             f'ori={self.pose_map.fixed_orientation}'
         )
+        self._init_graveyard_pose_maps_from_params()
         self.motion = ZFirstMotionPlanner(
             self.pose_map,
             movel=self._movel,
@@ -78,6 +114,7 @@ class DoosanPickPlaceNode(Node):
             retreat_velocity=float(self.get_parameter('retreat_velocity').value),
             retreat_acceleration=float(self.get_parameter('retreat_acceleration').value),
             z_approach_offset_mm=float(self.get_parameter('z_approach_offset_mm').value),
+            safety_gate=self._safety_gate,
         )
 
         self.board_pub = self.create_publisher(BoardState, 'chess/board_state', 10)
@@ -89,6 +126,13 @@ class DoosanPickPlaceNode(Node):
         self.create_service(MoveToObserve, 'robot/move_to_observe', self.handle_observe, callback_group=group)
         self.create_service(RetreatArm, 'robot/retreat_arm', self.handle_retreat, callback_group=group)
         self.create_service(UndoMoves, 'robot/undo_moves', self.handle_undo_moves, callback_group=group)
+        self.create_subscription(
+            Bool,
+            'chess/hand_in_board',
+            self._on_hand_in_board,
+            10,
+            callback_group=group,
+        )
         self._action_server = ActionServer(
             self,
             ExecuteMove,
@@ -109,12 +153,22 @@ class DoosanPickPlaceNode(Node):
         )
 
         self._publish_board_state('board initialized')
-        self._go_home()
+        self._home_timer = self.create_timer(0.1, self._run_initial_home, callback_group=group)
         self.get_logger().info(
             f'graveyard enabled={self._graveyard_enabled()} '
             f'robot_color={self._robot_color()}'
         )
-        self.get_logger().info('Doosan pick-place node ready (at home)')
+        self.get_logger().info('Doosan pick-place node ready (services up, homing deferred)')
+
+    def _run_initial_home(self) -> None:
+        self._home_timer.cancel()
+        try:
+            self._go_home()
+            self.get_logger().info('Doosan pick-place node at home')
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'initial home move failed (robot services will still run): {exc}'
+            )
 
     def _should_publish_board_state(self) -> bool:
         return bool(self.get_parameter('publish_board_state').value)
@@ -130,16 +184,120 @@ class DoosanPickPlaceNode(Node):
         self.get_logger().info(f'movej home: {joints}')
         self._movej(joints, vel=self._home_vel(), acc=self._home_acc())
         self._mwait()
+        self._at_observe_pose = True
+
+    def _set_motion_segment(self, segment: MotionSegment, **ctx) -> None:
+        self._motion_segment = segment
+        self._segment_ctx = dict(ctx)
+
+    def _run_motion_step(self, goal_handle, fn) -> None:
+        while True:
+            try:
+                fn()
+                return
+            except MotionInterrupted:
+                self.get_logger().info(
+                    f'motion interrupted during {self._motion_segment.value} — recovering'
+                )
+                self._ensure_goal_active(goal_handle)
+                self.motion.ensure_travel_height(self._segment_ctx.get('pose_map'))
+                self._replay_motion_segment(goal_handle)
+
+    def _replay_motion_segment(self, goal_handle) -> None:
+        seg = self._motion_segment
+        ctx = self._segment_ctx
+        if seg == MotionSegment.NONE:
+            return
+        pmap = ctx.get('pose_map')
+        col = int(ctx.get('col', 0))
+        row = int(ctx.get('row', 0))
+
+        if seg in {
+            MotionSegment.TRAVEL_PICK,
+            MotionSegment.TRAVEL_PLACE,
+            MotionSegment.CAPTURE_TRAVEL,
+            MotionSegment.GY_TRAVEL,
+        }:
+            self._ensure_goal_active(goal_handle)
+            self.motion.ensure_travel_height(pmap)
+            self._ensure_goal_active(goal_handle)
+            self.motion.move_xy_at_travel(col, row, pmap)
+            return
+
+        if seg in {
+            MotionSegment.DESCEND_PICK,
+            MotionSegment.CAPTURE_DESCEND,
+        }:
+            self._ensure_goal_active(goal_handle)
+            self.motion.ensure_travel_height(pmap)
+            self._ensure_goal_active(goal_handle)
+            self.motion.move_xy_at_travel(col, row, pmap)
+            self._ensure_goal_active(goal_handle)
+            self.motion.descend_to_pick(pmap)
+            self._close_gripper()
+            return
+
+        if seg in {
+            MotionSegment.DESCEND_PLACE,
+            MotionSegment.GY_DESCEND,
+        }:
+            self._ensure_goal_active(goal_handle)
+            self.motion.ensure_travel_height(pmap)
+            self._ensure_goal_active(goal_handle)
+            self.motion.move_xy_at_travel(col, row, pmap)
+            self._ensure_goal_active(goal_handle)
+            self.motion.descend_to_place(pmap)
+            self._open_gripper()
+            return
+
+        if seg in {
+            MotionSegment.ASCEND_PICK,
+            MotionSegment.CAPTURE_ASCEND,
+            MotionSegment.ASCEND_PLACE,
+            MotionSegment.GY_ASCEND,
+        }:
+            self._ensure_goal_active(goal_handle)
+            self.motion.ascend_to_travel(
+                slow=seg == MotionSegment.ASCEND_PLACE,
+                pose_map=pmap,
+            )
 
     def _use_graveyard_for_capture(self, captured_symbol: str | None) -> bool:
         del captured_symbol
         return self._graveyard_enabled()
 
+    def _board_flipped(self) -> bool:
+        from chess_robot_motion.board_orientation import is_board_flipped
+
+        return is_board_flipped(str(self.get_parameter('board_orientation').value))
+
+    def _human_color(self) -> str:
+        return self._human_color_value
+
+    def _sync_graveyard_sides(self) -> None:
+        self._human_color_value = apply_human_color_to_graveyards(
+            self._human_color_value,
+            self.robot_graveyard,
+            self.human_graveyard,
+        )
+
+    def _set_human_color(self, human_color: str) -> None:
+        color = normalize_human_color(human_color)
+        if color is None:
+            return
+        prev_robot_side = self._robot_graveyard_side()
+        self._human_color_value = color
+        self._sync_graveyard_sides()
+        if self._robot_graveyard_side() != prev_robot_side:
+            self._graveyard_pose_maps.clear()
+            self._reload_graveyard_pose_maps()
+            self._ensure_joint_graveyard_anchors()
+
     def _graveyard_enabled(self) -> bool:
         return bool(self.get_parameter('graveyard_enabled').value)
 
     def _robot_color(self) -> str:
-        return str(self.get_parameter('robot_color').value).strip().lower()
+        return robot_chess_color(self._human_color())
 
     def _resolve_captured_symbol(self, captured_symbol: str | None) -> str:
         if captured_symbol:
@@ -150,8 +308,98 @@ class DoosanPickPlaceNode(Node):
         )
         return default
 
+    def _robot_graveyard_side(self) -> str:
+        from chess_robot_motion.graveyard_sides import robot_graveyard_side
+
+        return robot_graveyard_side(self._human_color())
+
     def _human_graveyard_side(self) -> str:
-        return 'white' if self._robot_color() == 'black' else 'black'
+        from chess_robot_motion.graveyard_sides import human_graveyard_side
+
+        return human_graveyard_side(self._human_color())
+
+    def _graveyard_use_joint_anchor(self, side: str) -> bool:
+        side = side.strip().lower()
+        if side == 'white':
+            return bool(self.get_parameter('graveyard_a0_anchor_from_joints').value)
+        return bool(self.get_parameter('graveyard_h9_anchor_from_joints').value)
+
+    def _graveyard_posx_from_params(self, side: str) -> list[float] | None:
+        if self._graveyard_use_joint_anchor(side):
+            return None
+        side = side.strip().lower()
+        key = 'graveyard_a0_posx' if side == 'white' else 'graveyard_h9_posx'
+        raw = list(self.get_parameter(key).value)
+        if len(raw) < 6:
+            return None
+        return [float(v) for v in raw[:6]]
+
+    def _graveyard_side_params(self, side: str) -> tuple[str, float, float, int]:
+        side = side.strip().lower()
+        if side == 'white':
+            return (
+                'a0',
+                float(self.get_parameter('white_graveyard_col_step_mm').value),
+                float(self.get_parameter('white_graveyard_row_step_mm').value),
+                0,
+            )
+        return (
+            'h9',
+            float(self.get_parameter('graveyard_col_step_mm').value),
+            float(self.get_parameter('graveyard_row_step_mm').value),
+            7,
+        )
+
+    def _graveyard_z_levels(self, side: str, anchor_z: float) -> tuple[float, float]:
+        z_pick_param = self.get_parameter('graveyard_z_pick_mm').value
+        z_travel_param = self.get_parameter('graveyard_z_travel_mm').value
+        z_pick_mm = float(z_pick_param) if z_pick_param is not None and float(z_pick_param) > 0 else float(anchor_z)
+        z_travel_mm = (
+            float(z_travel_param)
+            if z_travel_param is not None and float(z_travel_param) > 0
+            else self.pose_map.z_travel_mm
+        )
+        pick_offset = float(self.get_parameter('graveyard_z_pick_offset_mm').value)
+        if pick_offset == 0.0:
+            pick_offset = float(self.get_parameter('graveyard_z_offset_mm').value)
+        white_pick_offset = float(self.get_parameter('white_graveyard_z_pick_offset_mm').value)
+        if side == 'black':
+            z_pick_mm += pick_offset
+        elif side == 'white':
+            z_pick_mm += white_pick_offset
+        return z_pick_mm, z_travel_mm
+
+    def _build_graveyard_pose_map(self, side: str, anchor_posx: list[float]) -> GraveyardPoseMap:
+        anchor_name, col_step, row_step, anchor_col = self._graveyard_side_params(side)
+        z_pick_mm, z_travel_mm = self._graveyard_z_levels(side, anchor_posx[2])
+        gy_map = GraveyardPoseMap(
+            anchor_h9_posx=anchor_posx,
+            col_step_mm=col_step,
+            row_step_mm=row_step,
+            anchor_col=anchor_col,
+            z_pick_mm=z_pick_mm,
+            z_travel_mm=z_travel_mm,
+        )
+        gy_map.travel_extra_mm = float(self.get_parameter('graveyard_z_travel_extra_mm').value)
+        self.get_logger().info(
+            f'graveyard {anchor_name} from params: xy={gy_map.anchor_x},'
+            f'{gy_map.anchor_y} z_pick={gy_map.z_pick_mm} '
+            f'z_travel={gy_map.z_travel_mm} travel_extra={gy_map.travel_extra_mm}'
+        )
+        return gy_map
+
+    def _init_graveyard_pose_maps_from_params(self) -> None:
+        if not self._graveyard_enabled():
+            return
+        for side in ('black', 'white'):
+            posx = self._graveyard_posx_from_params(side)
+            if posx is None:
+                continue
+            self._graveyard_pose_maps[side] = self._build_graveyard_pose_map(side, posx)
+
+    def _reload_graveyard_pose_maps(self) -> None:
+        self._graveyard_pose_maps.clear()
+        self._init_graveyard_pose_maps_from_params()
 
     def _calibrate_graveyard(self, side: str, *, return_home: bool = True) -> None:
         side = side.strip().lower()
@@ -159,34 +407,28 @@ class DoosanPickPlaceNode(Node):
             if return_home:
                 self._go_home()
             return
+        posx = self._graveyard_posx_from_params(side)
+        if posx is not None:
+            self._graveyard_pose_maps[side] = self._build_graveyard_pose_map(side, posx)
+            if return_home:
+                self._go_home()
+            return
+        anchor_name, col_step, row_step, anchor_col = self._graveyard_side_params(side)
         if side == 'white':
             joints = list(self.get_parameter('graveyard_a0_joints').value)
-            anchor_name = 'a0'
-            col_step = float(self.get_parameter('white_graveyard_col_step_mm').value)
-            row_step = float(self.get_parameter('white_graveyard_row_step_mm').value)
-            anchor_col = 0
         else:
             joints = list(self.get_parameter('graveyard_h9_joints').value)
-            anchor_name = 'h9'
-            col_step = float(self.get_parameter('graveyard_col_step_mm').value)
-            row_step = float(self.get_parameter('graveyard_row_step_mm').value)
-            anchor_col = 7
-        self.get_logger().info(f'graveyard calibration: movej {anchor_name} {joints}')
-        self._movej(joints, vel=self._home_vel(), acc=self._home_acc())
+        self.get_logger().info(
+            f'graveyard {side}: joint teach anchor at {anchor_name}'
+        )
+        teach_vel = float(self.get_parameter('graveyard_teach_velocity').value)
+        self.get_logger().info(
+            f'graveyard calibration: movej {anchor_name} {joints} vel={teach_vel}'
+        )
+        self._movej(joints, vel=teach_vel, acc=self._home_acc())
         self._mwait()
         anchor = list(self._get_current_posx()[0])
-        z_pick = self.get_parameter('graveyard_z_pick_mm').value
-        z_travel = self.get_parameter('graveyard_z_travel_mm').value
-        z_pick_mm = float(z_pick) if z_pick is not None and float(z_pick) > 0 else self.pose_map.z_pick_mm
-        z_travel_mm = (
-            float(z_travel) if z_travel is not None and float(z_travel) > 0 else self.pose_map.z_travel_mm
-        )
-        pick_offset = float(self.get_parameter('graveyard_z_pick_offset_mm').value)
-        if pick_offset == 0.0:
-            pick_offset = float(self.get_parameter('graveyard_z_offset_mm').value)
-        travel_extra = float(self.get_parameter('graveyard_z_travel_extra_mm').value)
-        if side == 'black':
-            z_pick_mm += pick_offset
+        z_pick_mm, z_travel_mm = self._graveyard_z_levels(side, anchor[2])
         gy_map = GraveyardPoseMap(
             anchor_h9_posx=anchor,
             col_step_mm=col_step,
@@ -195,7 +437,7 @@ class DoosanPickPlaceNode(Node):
             z_pick_mm=z_pick_mm,
             z_travel_mm=z_travel_mm,
         )
-        gy_map.travel_extra_mm = travel_extra
+        gy_map.travel_extra_mm = float(self.get_parameter('graveyard_z_travel_extra_mm').value)
         self._graveyard_pose_maps[side] = gy_map
         pose_map = self._graveyard_pose_maps[side]
         self.get_logger().info(
@@ -203,19 +445,35 @@ class DoosanPickPlaceNode(Node):
             f'{pose_map.anchor_y} z_pick={pose_map.z_pick_mm} '
             f'z_travel={pose_map.z_travel_mm} travel_extra={pose_map.travel_extra_mm}'
         )
+        self.get_logger().info(
+            f'graveyard {anchor_name} taught TCP posx='
+            f'[{pose_map.anchor_x:.3f}, {pose_map.anchor_y:.3f}, {pose_map.z_pick_mm:.3f}, '
+            f'{pose_map.fixed_orientation[0]:.3f}, {pose_map.fixed_orientation[1]:.3f}, '
+            f'{pose_map.fixed_orientation[2]:.3f}]'
+        )
         if return_home:
             self._go_home()
+
+    def _ensure_joint_graveyard_anchors(self) -> None:
+        if not self._graveyard_enabled():
+            return
+        for side in ('black', 'white'):
+            if self._graveyard_use_joint_anchor(side) and side not in self._graveyard_pose_maps:
+                self._calibrate_graveyard(side, return_home=True)
 
     def _ensure_graveyard_calibrated(self, side: str, *, return_home: bool = True) -> None:
         if side not in self._graveyard_pose_maps:
             self._calibrate_graveyard(side, return_home=return_home)
 
     def _graveyard_pose_map_for(self, side: str) -> GraveyardPoseMap:
-        self._ensure_graveyard_calibrated(side, return_home=False)
+        if side not in self._graveyard_pose_maps:
+            self._ensure_graveyard_calibrated(side, return_home=False)
+        if side not in self._graveyard_pose_maps:
+            raise RuntimeError(f'graveyard {side} not calibrated')
         return self._graveyard_pose_maps[side]
 
-    def _place_captured_in_graveyard(self, captured_symbol: str) -> None:
-        side = self._robot_color()
+    def _place_captured_in_graveyard(self, captured_symbol: str, goal_handle) -> None:
+        side = self._robot_graveyard_side()
         pose_map = self._graveyard_pose_map_for(side)
         if self.robot_graveyard.is_full():
             raise RuntimeError('graveyard full (16 slots occupied)')
@@ -224,13 +482,48 @@ class DoosanPickPlaceNode(Node):
             raise RuntimeError('graveyard full (no empty slot)')
         grave_col, grave_row = slot
         slot_name = graveyard_slot_name(grave_col, grave_row, side=side)
-        self.get_logger().info(f'graveyard place {slot_name} ({captured_symbol})')
-        self.motion.place_piece_at(
-            grave_col,
-            grave_row,
-            self._open_gripper,
+        target_x, target_y = pose_map.square_center_xy(grave_col, grave_row)
+        self.get_logger().info(
+            f'graveyard place {slot_name} side={side} ({captured_symbol}) '
+            f'xy=({target_x:.3f},{target_y:.3f}) z_pick={pose_map.z_pick_mm:.3f}'
+        )
+
+        self._set_motion_segment(
+            MotionSegment.GY_TRAVEL,
+            col=grave_col,
+            row=grave_row,
             pose_map=pose_map,
         )
+        self._ensure_goal_active(goal_handle)
+        self._run_motion_step(goal_handle, lambda: self.motion.ensure_travel_height(pose_map))
+
+        self._set_motion_segment(
+            MotionSegment.GY_DESCEND,
+            col=grave_col,
+            row=grave_row,
+            pose_map=pose_map,
+        )
+        self._ensure_goal_active(goal_handle)
+
+        def _gy_place() -> None:
+            self.motion.move_xy_at_travel(grave_col, grave_row, pose_map)
+            self.motion.descend_to_place(pose_map)
+            self._open_gripper()
+
+        self._run_motion_step(goal_handle, _gy_place)
+
+        self._set_motion_segment(
+            MotionSegment.GY_ASCEND,
+            col=grave_col,
+            row=grave_row,
+            pose_map=pose_map,
+        )
+        self._ensure_goal_active(goal_handle)
+        self._run_motion_step(
+            goal_handle,
+            lambda: self.motion.ascend_to_travel(slow=False, pose_map=pose_map),
+        )
+
         self.robot_graveyard.place_piece(grave_col, grave_row, captured_symbol)
         self.get_logger().info(f'graveyard state: {self.robot_graveyard.summary()}')
 
@@ -263,8 +556,11 @@ class DoosanPickPlaceNode(Node):
         self.declare_parameter('home_joints', [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17])
         self.declare_parameter('publish_board_state', True)
         self.declare_parameter('robot_color', 'black')
+        self.declare_parameter('board_orientation', 'standard')
         self.declare_parameter('graveyard_enabled', True)
         self.declare_parameter('graveyard_h9_joints', [-37.12, 8.08, 106.52, -0.02, 65.41, -36.25])
+        # [x, y, z, rx, ry, rz] BASE TCP at h9 anchor; empty = joint-teach fallback only
+        self.declare_parameter('graveyard_h9_posx', [310.274, -124.264, 266.273, 2.805, 179.832, 2.749])
         self.declare_parameter('graveyard_square_mm', 40.0)
         self.declare_parameter('graveyard_col_step_mm', -40.0)
         self.declare_parameter('graveyard_row_step_mm', -40.0)
@@ -273,9 +569,15 @@ class DoosanPickPlaceNode(Node):
         self.declare_parameter('graveyard_z_offset_mm', 0.0)  # deprecated: use graveyard_z_pick_offset_mm
         self.declare_parameter('graveyard_z_pick_offset_mm', 0.0)
         self.declare_parameter('graveyard_z_travel_extra_mm', 0.0)
-        self.declare_parameter('graveyard_a0_joints', [19.87, 41.8, 56.67, -0.03, 81.53, 19.86])
-        self.declare_parameter('white_graveyard_col_step_mm', 40.0)
+        self.declare_parameter('graveyard_a0_joints', [20.12, 41.84, 55.64, -0.03, 82.52, 15.62])
+        # Used only when graveyard_a0_anchor_from_joints is false (see joint teach at startup).
+        self.declare_parameter('graveyard_a0_posx', [590.274, 175.736, 271.273, 2.805, 179.832, 2.749])
+        self.declare_parameter('graveyard_a0_anchor_from_joints', False)
+        self.declare_parameter('graveyard_teach_velocity', 25.0)
+        self.declare_parameter('graveyard_h9_anchor_from_joints', False)
+        self.declare_parameter('white_graveyard_col_step_mm', -40.0)
         self.declare_parameter('white_graveyard_row_step_mm', 40.0)
+        self.declare_parameter('white_graveyard_z_pick_offset_mm', -20.0)
 
     def _init_gripper(self) -> None:
         self.gripper = RG(
@@ -310,14 +612,51 @@ class DoosanPickPlaceNode(Node):
         del goal_handle
         return CancelResponse.ACCEPT
 
+    def _on_hand_in_board(self, msg: Bool) -> None:
+        if msg.data:
+            self._safety_gate.request_pause()
+            self.get_logger().info('hand detected on board — motion paused')
+        else:
+            self._safety_gate.resume()
+            self.get_logger().info('hand cleared — motion resumed')
+
+    def _ensure_goal_active(self, goal_handle) -> None:
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            raise RuntimeError('canceled')
+        self._safety_gate.wait_if_paused()
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            raise RuntimeError('canceled')
+        if self._safety_gate.consume_interrupted():
+            self.get_logger().info(
+                f'hand pause cleared — replaying segment {self._motion_segment.value}'
+            )
+            self.motion.ensure_travel_height(self._segment_ctx.get('pose_map'))
+            self._replay_motion_segment(goal_handle)
+
     def handle_reset(self, request, response):
         del request
+        self._safety_gate.resume()
         self.board.reset()
         self.robot_graveyard.reset()
         self.human_graveyard.reset()
-        self._graveyard_pose_maps.clear()
-        self._open_gripper()
-        self._go_home()
+
+        def _physical_reset() -> None:
+            try:
+                self._open_gripper()
+                self._go_home()
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'reset homing failed: {exc}')
+
+        worker = threading.Thread(target=_physical_reset, daemon=True, name='reset_home')
+        worker.start()
+        worker.join(timeout=12.0)
+        if worker.is_alive():
+            self.get_logger().warn(
+                'reset go_home timed out — logical board reset still applied'
+            )
+
         self._publish_board_state('board reset to starting position')
         response.success = True
         response.message = 'board reset'
@@ -337,6 +676,19 @@ class DoosanPickPlaceNode(Node):
             human_gy_json = getattr(request, 'human_graveyard_slots_json', '') or ''
             if human_gy_json.strip():
                 self.human_graveyard.load_slots(GraveyardState.slots_from_json(human_gy_json))
+            human_color = getattr(request, 'human_color', '') or ''
+            if human_color.strip():
+                self._set_human_color(human_color)
+            orientation = getattr(request, 'board_orientation', '') or ''
+            if orientation.strip():
+                self.set_parameters([
+                    Parameter(
+                        'board_orientation',
+                        Parameter.Type.STRING,
+                        orientation.strip().lower(),
+                    )
+                ])
+                self.pose_map.board_flipped = self._board_flipped()
             response.success = True
             response.message = 'robot board synced from FEN'
             response.fen = self.board.fen
@@ -347,7 +699,7 @@ class DoosanPickPlaceNode(Node):
 
     def _graveyard_for_side(self, side: str) -> GraveyardState:
         side = side.strip().lower()
-        if side == self._robot_color():
+        if side == self._robot_graveyard_side():
             return self.robot_graveyard
         if side == self._human_graveyard_side():
             return self.human_graveyard
@@ -434,8 +786,11 @@ class DoosanPickPlaceNode(Node):
 
     def handle_observe(self, request, response):
         del request
-        self.get_logger().info('move_to_observe: moving to home/observe joints')
-        self._go_home()
+        if self._at_observe_pose:
+            self.get_logger().info('move_to_observe: already at observe/home — skipping movej')
+        else:
+            self.get_logger().info('move_to_observe: moving to home/observe joints')
+            self._go_home()
         response.success = True
         response.message = 'at observe pose (home joints)'
         return response
@@ -462,20 +817,36 @@ class DoosanPickPlaceNode(Node):
         if not self._use_graveyard_for_capture(captured_symbol):
             raise RuntimeError('graveyard disabled; cannot capture piece')
         captured_symbol = self._resolve_captured_symbol(captured_symbol)
-        self._ensure_graveyard_calibrated(self._robot_color(), return_home=True)
 
         feedback.progress = progress_start
         feedback.status = 'removing captured piece'
         goal_handle.publish_feedback(feedback)
 
         self._open_gripper()
-        self.motion.pick_piece_at(col, row, self._close_gripper)
+
+        self._set_motion_segment(MotionSegment.CAPTURE_TRAVEL, col=col, row=row)
+        self._ensure_goal_active(goal_handle)
+        self._run_motion_step(goal_handle, lambda: self.motion.ensure_travel_height())
+
+        self._set_motion_segment(MotionSegment.CAPTURE_DESCEND, col=col, row=row)
+        self._ensure_goal_active(goal_handle)
+
+        def _capture_pick() -> None:
+            self.motion.move_xy_at_travel(col, row)
+            self.motion.descend_to_pick()
+            self._close_gripper()
+
+        self._run_motion_step(goal_handle, _capture_pick)
+
+        self._set_motion_segment(MotionSegment.CAPTURE_ASCEND, col=col, row=row)
+        self._ensure_goal_active(goal_handle)
+        self._run_motion_step(goal_handle, lambda: self.motion.ascend_to_travel())
 
         feedback.progress = progress_end
         feedback.status = 'placing captured piece in graveyard'
         goal_handle.publish_feedback(feedback)
 
-        self._place_captured_in_graveyard(captured_symbol)
+        self._place_captured_in_graveyard(captured_symbol, goal_handle)
         self.motion.ensure_travel_height()
 
     def _pick_and_place(
@@ -495,23 +866,51 @@ class DoosanPickPlaceNode(Node):
         feedback.status = 'travel to pick square'
         goal_handle.publish_feedback(feedback)
 
-        self.motion.ensure_travel_height()
-        self.motion.move_xy_at_travel(from_col, from_row)
+        self._set_motion_segment(MotionSegment.TRAVEL_PICK, col=from_col, row=from_row)
+        self._ensure_goal_active(goal_handle)
+
+        def _travel_pick() -> None:
+            self.motion.ensure_travel_height()
+            self.motion.move_xy_at_travel(from_col, from_row)
+
+        self._run_motion_step(goal_handle, _travel_pick)
 
         feedback.status = 'picking'
         goal_handle.publish_feedback(feedback)
-        self.motion.descend_to_pick()
-        self._close_gripper()
-        self.motion.ascend_to_travel()
+
+        self._set_motion_segment(MotionSegment.DESCEND_PICK, col=from_col, row=from_row)
+        self._ensure_goal_active(goal_handle)
+
+        def _descend_pick() -> None:
+            self.motion.descend_to_pick()
+            self._close_gripper()
+
+        self._run_motion_step(goal_handle, _descend_pick)
+
+        self._set_motion_segment(MotionSegment.ASCEND_PICK, col=from_col, row=from_row)
+        self._ensure_goal_active(goal_handle)
+        self._run_motion_step(goal_handle, lambda: self.motion.ascend_to_travel())
 
         feedback.progress = progress_place
         feedback.status = 'travel to place square'
         goal_handle.publish_feedback(feedback)
 
-        self.motion.move_xy_at_travel(to_col, to_row)
-        self.motion.descend_to_place()
-        self._open_gripper()
-        self.motion.ascend_to_travel(slow=False)
+        self._set_motion_segment(MotionSegment.TRAVEL_PLACE, col=to_col, row=to_row)
+        self._ensure_goal_active(goal_handle)
+        self._run_motion_step(goal_handle, lambda: self.motion.move_xy_at_travel(to_col, to_row))
+
+        self._set_motion_segment(MotionSegment.DESCEND_PLACE, col=to_col, row=to_row)
+        self._ensure_goal_active(goal_handle)
+
+        def _descend_place() -> None:
+            self.motion.descend_to_place()
+            self._open_gripper()
+
+        self._run_motion_step(goal_handle, _descend_place)
+
+        self._set_motion_segment(MotionSegment.ASCEND_PLACE, col=to_col, row=to_row)
+        self._ensure_goal_active(goal_handle)
+        self._run_motion_step(goal_handle, lambda: self.motion.ascend_to_travel(slow=False))
 
     def execute_move(self, goal_handle):
         move = goal_handle.request.move
@@ -533,6 +932,7 @@ class DoosanPickPlaceNode(Node):
 
         feedback = ExecuteMove.Feedback()
         try:
+            self._at_observe_pose = False
             is_capture = validation.is_capture
             is_en_passant = validation.is_en_passant or bool(move.is_en_passant)
             is_castling = validation.is_castling or bool(move.is_castling)
@@ -611,6 +1011,13 @@ class DoosanPickPlaceNode(Node):
             result.success = True
             result.message = 'move completed'
             return result
+        except RuntimeError as exc:
+            if str(exc) == 'canceled':
+                result = ExecuteMove.Result()
+                result.success = False
+                result.message = 'canceled'
+                return result
+            raise
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f'move failed: {exc}')
             goal_handle.abort()
@@ -624,7 +1031,7 @@ class DoosanPickPlaceNode(Node):
 
     def _execute_restore_move(self, move: RestoreMove) -> None:
         gy_side = (
-            self._robot_color() if move.graveyard_id == 'robot' else self._human_graveyard_side()
+            self._robot_graveyard_side() if move.graveyard_id == 'robot' else self._human_graveyard_side()
         )
         graveyard_map = None
         if self._restore_move_needs_graveyard(move):
@@ -676,9 +1083,6 @@ class DoosanPickPlaceNode(Node):
                 goal_handle.succeed()
                 return result
 
-            self._ensure_graveyard_calibrated(self._robot_color(), return_home=True)
-            self._ensure_graveyard_calibrated(self._human_graveyard_side(), return_home=True)
-
             moves = plan_board_restore(self.board, self.robot_graveyard, self.human_graveyard)
             total = len(moves)
             self.get_logger().info(f'restore board: {total} planned moves')
@@ -702,6 +1106,7 @@ class DoosanPickPlaceNode(Node):
             self.robot_graveyard.reset()
             self.human_graveyard.reset()
             self._graveyard_pose_maps.clear()
+            self._reload_graveyard_pose_maps()
             self._go_home()
             self._publish_board_state('board restored to starting position')
 
@@ -765,7 +1170,6 @@ def main(args=None) -> None:
     node = DoosanPickPlaceNode(dsr_api)
     executor = MultiThreadedExecutor()
     executor.add_node(node)
-    executor.add_node(dsr_api.node)
     try:
         executor.spin()
     except KeyboardInterrupt:

@@ -50,6 +50,8 @@ class MoveMatcher:
             if prev != curr
         ]
         changed_names = {index_to_square_name(idx) for idx in changed}
+        if not changed_names:
+            return MoveMatchResult(candidates=[], ambiguous=False, matched=False)
 
         candidates: list[str] = []
         for move in board.legal_moves:
@@ -71,14 +73,14 @@ class MoveMatcher:
                 matched=False,
             )
 
-        scored = self._score_legal_moves(board, previous_cells, current_cells)
+        scored = self._score_legal_moves(board, previous_cells, current_cells, changed_names)
         if not scored:
             return MoveMatchResult(candidates=[], ambiguous=False, matched=False)
 
         best_score = scored[0][0]
         top = [uci for score, uci in scored if score == best_score]
         top = _pick_promotion_candidate(top)
-        if len(top) == 1 and best_score >= 4:
+        if len(top) == 1 and best_score >= 6:
             return MoveMatchResult(candidates=top, ambiguous=False, matched=True)
 
         return MoveMatchResult(
@@ -92,7 +94,10 @@ class MoveMatcher:
         board: chess.Board,
         previous_cells: list[bool],
         current_cells: list[bool],
+        changed_names: set[str],
     ) -> list[tuple[int, str]]:
+        if not changed_names:
+            return []
         scored: list[tuple[int, str]] = []
         for move in board.legal_moves:
             score = self._score_move(board, move, previous_cells, current_cells)
@@ -135,6 +140,9 @@ class MoveMatcher:
             if previous_cells[cap_idx] and not current_cells[cap_idx]:
                 score += 4
 
+        if board.is_castling(move):
+            score += 6
+
         for name in relevant_changed_squares(board, move):
             idx = square_name_to_index(name)
             if previous_cells[idx] and not current_cells[idx]:
@@ -150,6 +158,10 @@ class MoveMatcher:
         move: chess.Move,
         changed_names: set[str],
     ) -> bool:
+        from_sq = chess.square_name(move.from_square)
+        to_sq = chess.square_name(move.to_square)
+        if board.is_castling(move):
+            return from_sq in changed_names and to_sq in changed_names
         return relevant_changed_squares(board, move).issubset(changed_names)
 
     def resolve_from_squares(

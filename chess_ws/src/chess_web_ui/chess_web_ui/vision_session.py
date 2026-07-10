@@ -10,7 +10,67 @@ from chess_game.board_utils import index_to_square_name, occupancy_from_fen, san
 from chess_game.game_state import GameState
 from chess_game.move_matcher import MoveMatcher
 from chess_game.move_resolve import promotion_notice, promotion_piece_char, resolve_legal_uci
-from chess_game.occupancy_diff import detect_move_from_diff, infer_captured_piece
+from chess_game.occupancy_diff import (
+    castling_diff_pattern,
+    detect_move_from_diff,
+    infer_captured_piece,
+)
+
+
+def _departed_arrived(
+    baseline: list[bool],
+    filtered: list[bool],
+) -> tuple[list[str], list[str]]:
+    departed: list[str] = []
+    arrived: list[str] = []
+    for idx, (prev, curr) in enumerate(zip(baseline, filtered)):
+        if prev and not curr:
+            departed.append(index_to_square_name(idx))
+        elif not prev and curr:
+            arrived.append(index_to_square_name(idx))
+    return departed, arrived
+
+
+def _no_move_outcome(
+    *,
+    baseline: list[bool],
+    filtered: list[bool],
+    fen_before: str,
+    departed: list[str],
+    arrived: list[str],
+) -> ScanOutcome:
+    return ScanOutcome(
+        success=False,
+        message=(
+            f'no move detected; departed={departed or "-"} arrived={arrived or "-"}'
+        ),
+        cells=list(filtered),
+        fen=fen_before,
+    )
+
+
+def _has_minimum_move_evidence(
+    departed: list[str],
+    arrived: list[str],
+    fen: str,
+) -> bool:
+    if len(departed) + len(arrived) == 0:
+        return False
+    if len(departed) == 2 and len(arrived) == 0:
+        return castling_diff_pattern(departed, arrived, fen)
+    return len(departed) + len(arrived) >= 2
+
+
+def _from_square_matches_turn(fen: str, from_sq: str) -> bool:
+    board = chess.Board(fen)
+    try:
+        square = chess.parse_square(from_sq)
+    except ValueError:
+        return False
+    piece = board.piece_at(square)
+    if piece is None:
+        return False
+    return piece.color == board.turn
 
 
 @dataclass
@@ -22,6 +82,7 @@ class ScanOutcome:
     to_square: str = ''
     captured_piece: str = ''
     fen: str = ''
+    fen_before: str = ''
     uci: str = ''
     promotion_piece: str = ''
     promotion_required: bool = False
@@ -84,6 +145,8 @@ class VisionSession:
         filtered: list[bool],
         promotion: str = '',
     ) -> ScanOutcome | None:
+        if not _from_square_matches_turn(fen_before, from_sq):
+            return None
         if promotion:
             from chess_game.move_resolve import resolve_legal_uci_full
 
@@ -105,6 +168,8 @@ class VisionSession:
                         uci=f'{from_sq}{to_sq}',
                         fen=fen_before,
                     )
+                if not _from_square_matches_turn(fen_before, from_sq):
+                    return None
                 matcher_result = self.matcher.match_from_occupancy(fen_before, baseline, filtered)
                 if matcher_result.matched and matcher_result.best:
                     uci = matcher_result.best
@@ -129,6 +194,7 @@ class VisionSession:
             to_square=to_sq,
             captured_piece=captured,
             fen=self.game.fen,
+            fen_before=fen_before,
             uci=uci,
             promotion_piece=promo,
         )
@@ -164,43 +230,51 @@ class VisionSession:
 
         fen_before = self.game.fen
         filtered = self._filter_cells(cells, conf, fen_before)
-        diff = detect_move_from_diff(baseline, filtered, fen_before)
-        if diff is not None and diff.confident:
-            outcome = self._resolve_and_apply(
-                fen_before,
-                diff.from_square,
-                diff.to_square,
+        departed, arrived = _departed_arrived(baseline, filtered)
+        if filtered == baseline or not _has_minimum_move_evidence(departed, arrived, fen_before):
+            return _no_move_outcome(
                 baseline=baseline,
                 filtered=filtered,
+                fen_before=fen_before,
+                departed=departed,
+                arrived=arrived,
             )
-            if outcome is not None:
-                inference = ' inferred' if diff.via_inference else ''
-                baseline_note = ' (fen baseline)' if used_fen_baseline else ''
-                outcome.message = f'{outcome.message}{inference}{baseline_note}'
-                return outcome
-            if self._promotion_candidates(fen_before, diff.from_square, diff.to_square):
+
+        diff = detect_move_from_diff(baseline, filtered, fen_before)
+        if diff is not None and diff.confident and not diff.via_inference:
+            if not _from_square_matches_turn(fen_before, diff.from_square):
+                pass
+            else:
+                outcome = self._resolve_and_apply(
+                    fen_before,
+                    diff.from_square,
+                    diff.to_square,
+                    baseline=baseline,
+                    filtered=filtered,
+                )
+                if outcome is not None:
+                    baseline_note = ' (fen baseline)' if used_fen_baseline else ''
+                    outcome.message = f'{outcome.message}{baseline_note}'
+                    return outcome
+                if self._promotion_candidates(fen_before, diff.from_square, diff.to_square):
+                    return ScanOutcome(
+                        success=False,
+                        message='promotion_required',
+                        promotion_required=True,
+                        cells=list(filtered),
+                        from_square=diff.from_square,
+                        to_square=diff.to_square,
+                        uci=f'{diff.from_square}{diff.to_square}',
+                        fen=fen_before,
+                    )
                 return ScanOutcome(
                     success=False,
-                    message='promotion_required',
-                    promotion_required=True,
+                    message=f'illegal move: {diff.from_square}{diff.to_square}',
                     cells=list(filtered),
                     from_square=diff.from_square,
                     to_square=diff.to_square,
-                    uci=f'{diff.from_square}{diff.to_square}',
                     fen=fen_before,
                 )
-            return ScanOutcome(
-                success=False,
-                message=(
-                    f'illegal move: {diff.from_square} -> {diff.to_square}; '
-                    'correct the board or try again'
-                ),
-                cells=list(filtered),
-                from_square=diff.from_square,
-                to_square=diff.to_square,
-                uci=f'{diff.from_square}{diff.to_square}',
-                fen=fen_before,
-            )
 
         result = self.matcher.match_from_occupancy(
             fen_before,
@@ -209,19 +283,17 @@ class VisionSession:
         )
         if result.matched and result.best:
             from_sq, to_sq = result.best[:2], result.best[2:4]
-            outcome = self._resolve_and_apply(
-                fen_before,
-                from_sq,
-                to_sq,
-                baseline=baseline,
-                filtered=filtered,
-            )
-            if outcome is not None:
-                outcome.message = f'{outcome.message} (legal match)'
-                return outcome
-
-        if result.matched and result.best:
-            from_sq, to_sq = result.best[:2], result.best[2:4]
+            if _from_square_matches_turn(fen_before, from_sq):
+                outcome = self._resolve_and_apply(
+                    fen_before,
+                    from_sq,
+                    to_sq,
+                    baseline=baseline,
+                    filtered=filtered,
+                )
+                if outcome is not None:
+                    outcome.message = f'{outcome.message} (legal match)'
+                    return outcome
             if self._promotion_candidates(fen_before, from_sq, to_sq):
                 return ScanOutcome(
                     success=False,
@@ -244,20 +316,12 @@ class VisionSession:
                 fen=fen_before,
             )
 
-        departed, arrived = [], []
-        for idx, (prev, curr) in enumerate(zip(baseline, filtered)):
-            if prev and not curr:
-                departed.append(index_to_square_name(idx))
-            elif not prev and curr:
-                arrived.append(index_to_square_name(idx))
-
-        return ScanOutcome(
-            success=False,
-            message=(
-                f'no move detected; departed={departed or "-"} arrived={arrived or "-"}'
-            ),
-            cells=list(filtered),
-            fen=fen_before,
+        return _no_move_outcome(
+            baseline=baseline,
+            filtered=filtered,
+            fen_before=fen_before,
+            departed=departed,
+            arrived=arrived,
         )
 
     def set_board_from_fen(self, fen: str) -> ScanOutcome:

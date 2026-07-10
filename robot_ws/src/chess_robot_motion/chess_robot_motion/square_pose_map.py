@@ -46,6 +46,7 @@ class CalibratedSquarePoseMap:
         fixed_orientation: tuple[float, float, float] = (2.805, 179.832, 2.749),
         col_step_mm: float | None = None,
         row_step_mm: float | None = None,
+        board_flipped: bool = False,
     ) -> None:
         self.anchor_x, self.anchor_y = anchor_a1
         self.square_size_mm = square_size_mm
@@ -54,8 +55,15 @@ class CalibratedSquarePoseMap:
         self.z_pick_mm = z_pick_mm
         self.z_travel_mm = z_travel_mm
         self.fixed_orientation = list(fixed_orientation)
+        self.board_flipped = board_flipped
+
+    def _map_square(self, col: int, row: int) -> tuple[int, int]:
+        if self.board_flipped:
+            return 7 - col, 7 - row
+        return col, row
 
     def square_center_xy(self, col: int, row: int) -> tuple[float, float]:
+        col, row = self._map_square(col, row)
         x = self.anchor_x + self.col_step_mm * col
         y = self.anchor_y + self.row_step_mm * row
         return x, y

@@ -39,18 +39,30 @@ def test_detect_e2e4() -> None:
 
 
 def test_detect_e2e4_when_e2_still_reads_occupied() -> None:
-    """Depth noise: e2 stays occupied in scan but e4 becomes occupied."""
+    """Depth noise: e2 may stay occupied; e4 arrival plus e2 departure still detects e2e4."""
     session = VisionSession()
     before = _starting_cells()
     session.apply_initial_scan(before)
 
     after = list(before)
-    # e2 left True on purpose
-    after[28] = True  # e4
+    after[12] = False  # e2
+    after[28] = True   # e4
     outcome = session.apply_player_move_scan(after)
     assert outcome.success
     assert outcome.from_square == 'e2'
     assert outcome.to_square == 'e4'
+
+
+def test_no_move_when_unchanged_scan() -> None:
+    session = VisionSession()
+    before = _starting_cells()
+    session.apply_initial_scan(before)
+    fen_before = session.game.fen
+
+    outcome = session.apply_player_move_scan(list(before))
+    assert not outcome.success
+    assert 'no move detected' in outcome.message
+    assert session.game.fen == fen_before
 
 
 def test_detect_d7d5_when_d7_still_reads_occupied() -> None:
@@ -64,7 +76,8 @@ def test_detect_d7d5_when_d7_still_reads_occupied() -> None:
     session.apply_player_move_scan(after_white)
 
     after = list(session.previous_cells or after_white)
-    after[35] = True  # d5
+    after[51] = False  # d7
+    after[35] = True   # d5
     outcome = session.apply_player_move_scan(after)
     assert outcome.success
     assert outcome.from_square == 'd7'

@@ -4,6 +4,10 @@ string fen
 string graveyard_slots_json
 # Optional JSON array (length 16) for human/opponent graveyard sync.
 string human_graveyard_slots_json
+# Human player color (white|black) for graveyard side sync on robot node.
+string human_color
+# Board orientation: standard | flipped (physical 180° board).
+string board_orientation
 ---
 bool success
 string message

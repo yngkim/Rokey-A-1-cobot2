@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   BoardResponse,
+  BoardOrientation,
   Difficulty,
   HumanColor,
   fetchBoard,
@@ -10,6 +11,9 @@ import {
   postBoardCorrect,
   postResign,
   postRevertIllegalMove,
+  postTwinVerify,
+  postTwinConfig,
+  postHandConfig,
   postUndo,
   postVoiceMove,
   resetBoard,
@@ -17,7 +21,7 @@ import {
 } from './chess';
 import { useBotTts } from './hooks/useBotTts';
 import { useVoiceCommand } from './hooks/useVoiceCommand';
-import { loadUserSettings, type UserSettings } from './lib/userSettings';
+import { loadUserSettings, saveUserSettings, type UserSettings } from './lib/userSettings';
 import LobbyView from './views/LobbyView';
 import GameView from './views/GameView';
 import PromotionModal from './components/PromotionModal';
@@ -29,6 +33,7 @@ export default function App() {
   const [board, setBoard] = useState<BoardResponse | null>(null);
   const [humanColor, setHumanColor] = useState<HumanColor>('white');
   const [difficulty, setDifficulty] = useState<Difficulty>('medium');
+  const [boardOrientation, setBoardOrientation] = useState<BoardOrientation>('standard');
   const [userSettings, setUserSettings] = useState<UserSettings>(() => loadUserSettings());
   const [ttsMuted, setTtsMuted] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -56,6 +61,7 @@ export default function App() {
       setBoard(data);
       if (data.human_color) setHumanColor(data.human_color);
       if (data.difficulty) setDifficulty(data.difficulty);
+      if (data.board_orientation) setBoardOrientation(data.board_orientation);
       if (data.game_phase === 'playing') setScreen('game');
     } catch (err) {
       setError(err instanceof Error ? err.message : '보드 로드 실패');
@@ -71,7 +77,7 @@ export default function App() {
 
   useEffect(() => {
     if (screen !== 'game') return undefined;
-    const timer = window.setInterval(() => setCameraTick(Date.now()), 400);
+    const timer = window.setInterval(() => setCameraTick(Date.now()), 100);
     return () => window.clearInterval(timer);
   }, [screen]);
 
@@ -79,7 +85,12 @@ export default function App() {
     setBusy(true);
     setError('');
     try {
-      await postGameConfig(humanColor, difficulty);
+      await postGameConfig(
+        humanColor,
+        difficulty,
+        boardOrientation,
+        userSettings.hand_auto_confirm_enabled,
+      );
       const data = await resetBoard();
       setBoard(data);
       setScreen('game');
@@ -134,7 +145,7 @@ export default function App() {
     setBusy(true);
     setError('');
     try {
-      await postGameConfig(humanColor, difficulty);
+      await postGameConfig(humanColor, difficulty, boardOrientation);
       const data = await resetBoard();
       setBoard(data);
     } catch (err) {
@@ -179,6 +190,54 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : '보드 정정 실패');
       throw err;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleTwinToggle = async (enabled: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postTwinConfig(enabled);
+      setBoard(data);
+      setCameraTick(Date.now());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '사이드뷰 검증 설정 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleHandAutoConfirmToggle = async (enabled: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postHandConfig(enabled);
+      setBoard(data);
+      setUserSettings((prev) => {
+        const next = { ...prev, hand_auto_confirm_enabled: enabled };
+        saveUserSettings(next);
+        return next;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '손 감지 설정 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleTwinVerify = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postTwinVerify({ use_fresh_scan: true });
+      setBoard(data);
+      if (!data.twin_report?.aligned) {
+        setError(data.twin_report?.message || '보드 불일치가 감지되었습니다');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '보드 검증 실패');
     } finally {
       setBusy(false);
     }
@@ -236,12 +295,18 @@ export default function App() {
   const handleVoiceMove = async () => {
     setError('');
     try {
-      const transcript = await startListening(5000);
+      const transcript = await startListening(7000);
       setBusy(true);
       const data = await postVoiceMove(transcript);
       setBoard(data);
       if (data.promotion_required && data.from && data.to) {
         setPendingPromotion({ from: data.from, to: data.to });
+      }
+      if (data.voice_action && data.voice_action !== 'move' && data.voice_action !== 'parse_error') {
+        if (!data.success) {
+          setError(data.message || '음성 게임 명령 처리 실패');
+        }
+        return;
       }
       if (!data.success && !data.parse_error) {
         setError(data.message || '음성 명령 처리 실패');
@@ -262,10 +327,12 @@ export default function App() {
         <LobbyView
           difficulty={difficulty}
           humanColor={humanColor}
+          boardOrientation={boardOrientation}
           busy={busy}
           userSettings={userSettings}
           onDifficulty={setDifficulty}
           onColor={setHumanColor}
+          onBoardOrientation={setBoardOrientation}
           onUserSettings={setUserSettings}
           onStart={handleStart}
         />
@@ -284,6 +351,9 @@ export default function App() {
           onResign={handleResign}
           onUndo={handleUndo}
           onVoiceMove={handleVoiceMove}
+          onTwinVerify={handleTwinVerify}
+          onTwinToggle={handleTwinToggle}
+          onHandAutoConfirmToggle={handleHandAutoConfirmToggle}
           voiceListening={voiceListening}
           voiceInterimText={interimTranscript}
           onBoardCorrect={handleBoardCorrect}

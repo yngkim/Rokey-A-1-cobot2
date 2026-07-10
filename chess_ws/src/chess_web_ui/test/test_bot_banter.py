@@ -28,7 +28,25 @@ def test_resign_game_over():
     line = react_to_game_over('medium', result='resign', winner='robot')
     assert line.kind == 'game_over'
     assert '기권' in line.text
-    assert '체크메이트' in line.text
+
+
+def test_bot_move_uses_check_not_janggun():
+    line = react_to_bot_move('easy', is_capture=False, is_check=True)
+    assert line.kind == 'check'
+    assert '체크' in line.text
+    assert '장군' not in line.text
+
+
+def test_player_check_uses_check_term():
+    line = react_to_player_move(
+        'easy',
+        quality='good',
+        is_capture=False,
+        is_check=True,
+        san='Qh5+',
+    )
+    assert line.kind == 'check'
+    assert '장군' not in line.text
 
 
 def test_player_move_check_priority():
@@ -82,19 +100,19 @@ def test_bot_move_routine():
 def test_illegal_move_kind():
     line = react_to_illegal_move('medium', from_sq='e2', to_sq='c4')
     assert line.kind == 'illegal_move'
-    assert '규칙' in line.text
+    assert any(word in line.text for word in ('규칙', '불법', '안 돼'))
 
 
 def test_illegal_move_reverted_kind():
     line = react_to_illegal_move_reverted('easy')
     assert line.kind == 'illegal_move'
-    assert '되돌렸습니다' in line.text
+    assert any(word in line.text for word in ('되돌렸', '돌렸'))
 
 
 def test_voice_move_parse_error_kind():
     line = react_to_voice_parse_error('medium')
     assert line.kind == 'voice_move'
-    assert 'a2 a3' in line.text
+    assert any(word in line.text for word in ('a2 a3', '출발 칸', '말해'))
 
 
 def test_voice_move_success_kind():

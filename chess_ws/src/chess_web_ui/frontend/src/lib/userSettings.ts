@@ -13,6 +13,7 @@ export type UserSettings = {
   tts_enabled: boolean;
   tts_mode: TtsMode;
   tts_voice_preset: TtsVoicePreset;
+  hand_auto_confirm_enabled: boolean;
 };
 
 const STORAGE_KEY = 'chess_user_settings';
@@ -21,6 +22,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   tts_enabled: true,
   tts_mode: 'important',
   tts_voice_preset: 'female1',
+  hand_auto_confirm_enabled: false,
 };
 
 const IMPORTANT_KINDS: ReadonlySet<BotSpeechKind> = new Set([
@@ -51,6 +53,8 @@ export function loadUserSettings(): UserSettings {
       tts_enabled: parsed.tts_enabled ?? DEFAULT_SETTINGS.tts_enabled,
       tts_mode: parsed.tts_mode ?? DEFAULT_SETTINGS.tts_mode,
       tts_voice_preset: parsed.tts_voice_preset ?? DEFAULT_SETTINGS.tts_voice_preset,
+      hand_auto_confirm_enabled:
+        parsed.hand_auto_confirm_enabled ?? DEFAULT_SETTINGS.hand_auto_confirm_enabled,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };

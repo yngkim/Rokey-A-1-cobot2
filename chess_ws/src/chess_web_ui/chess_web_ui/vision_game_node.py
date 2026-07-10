@@ -18,7 +18,7 @@ from chess_msgs.srv import (
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Header
+from std_msgs.msg import Bool, Header
 
 from chess_web_ui.vision_session import VisionSession
 
@@ -48,6 +48,7 @@ class VisionGameNode(Node):
         self._busy = False
         self._live_cells: list[bool] | None = None
         self._live_stable = 0
+        self._hand_in_board = False
 
         group = ReentrantCallbackGroup()
         self.scan_client = self.create_client(ScanBoard, 'vision/scan_board', callback_group=group)
@@ -80,6 +81,13 @@ class VisionGameNode(Node):
             BoardState,
             'vision/live_occupancy',
             self._on_live_occupancy,
+            10,
+            callback_group=group,
+        )
+        self.create_subscription(
+            Bool,
+            'chess/hand_in_board',
+            self._on_hand_in_board,
             10,
             callback_group=group,
         )
@@ -179,10 +187,13 @@ class VisionGameNode(Node):
         )
         return response
 
+    def _on_hand_in_board(self, msg: Bool) -> None:
+        self._hand_in_board = bool(msg.data)
+
     def _on_live_occupancy(self, msg: BoardState) -> None:
         if not bool(self.get_parameter('auto_detect_moves').value):
             return
-        if self._busy or not msg.valid:
+        if self._busy or not msg.valid or self._hand_in_board:
             return
 
         cells = list(msg.occupancy.cells)
@@ -209,9 +220,15 @@ class VisionGameNode(Node):
         if not outcome.success:
             return
 
-        self._publish_state(outcome.message, cells=cells, valid=True)
+        if outcome.uci and outcome.fen_before:
+            game_id = f'auto_move:{outcome.uci}##{outcome.fen_before}'
+        elif outcome.uci:
+            game_id = f'auto_move:{outcome.uci}'
+        else:
+            game_id = 'vision_manual'
+        self._publish_state(outcome.message, cells=cells, valid=True, game_id=game_id)
         self.get_logger().info(
-            f'auto-detected move {outcome.from_square} -> {outcome.to_square}'
+            f'auto-detected move {outcome.from_square} -> {outcome.to_square} ({outcome.uci})'
         )
 
     def handle_set_board(self, request, response):
@@ -325,6 +342,7 @@ class VisionGameNode(Node):
         *,
         cells: list[bool] | None,
         valid: bool,
+        game_id: str = 'vision_manual',
     ) -> None:
         stamp = self.get_clock().now().to_msg()
         board_state = self._make_board_state(valid=valid, message=message, cells=cells)
@@ -336,7 +354,7 @@ class VisionGameNode(Node):
         snapshot.white_to_move = self.session.game.white_to_move
         snapshot.move_number = self.session.game.move_number
         snapshot.mode = self.session.game.mode
-        snapshot.game_id = 'vision_manual'
+        snapshot.game_id = game_id
         self.snapshot_pub.publish(snapshot)
 
     def _make_board_state(

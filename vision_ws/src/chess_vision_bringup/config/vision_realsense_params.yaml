@@ -28,6 +28,9 @@ occupancy_node:
     depth_cell_percentile: 30.0
     # observe 자세 — capture_observe_frame + calibrate_corners로 재측정
     board_manual_corners: [402, 69, 958, 51, 971, 600, 419, 616]
+    # corners were measured on this color frame size (auto-scaled if camera resolution differs)
+    board_calibration_width: 1280
+    board_calibration_height: 720
     publish_debug_image: true
     debug_image_topic: "vision/debug/top_view"
     use_starting_occupancy_on_failure: false

@@ -8,9 +8,15 @@ from typing import Literal
 import chess
 import chess.engine
 
-Difficulty = Literal['easy', 'medium', 'hard']
+Difficulty = Literal['beginner', 'easy', 'medium', 'hard', 'master']
 
 DIFFICULTY_PRESETS: dict[Difficulty, dict[str, object]] = {
+    'beginner': {
+        'limit_strength': True,
+        'uci_elo': 700,
+        'skill_level': 1,
+        'depth': 6,
+    },
     'easy': {
         'limit_strength': True,
         'uci_elo': 900,
@@ -24,6 +30,12 @@ DIFFICULTY_PRESETS: dict[Difficulty, dict[str, object]] = {
         'depth': 12,
     },
     'hard': {
+        'limit_strength': True,
+        'uci_elo': 2000,
+        'skill_level': 15,
+        'depth': 15,
+    },
+    'master': {
         'limit_strength': False,
         'uci_elo': 0,
         'skill_level': 20,

@@ -4,11 +4,15 @@ pick_place_node:
     robot_color: black
     graveyard_enabled: true
     graveyard_h9_joints: [-37.12, 8.08, 106.52, -0.02, 65.41, -36.25]
+    graveyard_h9_posx: [310.274, -124.264, 266.273, 2.805, 179.832, 2.749]
     graveyard_col_step_mm: -40.0
     graveyard_row_step_mm: -40.0
     graveyard_z_offset_mm: -25.0
     graveyard_z_pick_offset_mm: -25.0
     graveyard_z_travel_extra_mm: 0.0
-    graveyard_a0_joints: [19.87, 41.8, 56.67, -0.03, 81.53, 19.86]
-    white_graveyard_col_step_mm: 40.0
+    graveyard_a0_joints: [20.12, 41.84, 55.64, -0.03, 82.52, 15.62]
+    graveyard_a0_posx: [590.274, 175.736, 271.273, 2.805, 179.832, 2.749]
+    graveyard_a0_anchor_from_joints: false
+    graveyard_teach_velocity: 25.0
+    white_graveyard_col_step_mm: -40.0
     white_graveyard_row_step_mm: 40.0

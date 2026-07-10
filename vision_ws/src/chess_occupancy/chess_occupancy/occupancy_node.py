@@ -55,6 +55,8 @@ class OccupancyNode(Node):
             [0, 0, 0, 0, 0, 0, 0, 0],
             ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY),
         )
+        self.declare_parameter('board_calibration_width', 1280)
+        self.declare_parameter('board_calibration_height', 720)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('debug_image_topic', 'vision/debug/top_view')
         self.declare_parameter('use_starting_occupancy_on_failure', False)
@@ -155,6 +157,50 @@ class OccupancyNode(Node):
 
     def _manual_corners(self) -> list[float] | None:
         return self._manual_corners_value
+
+    def _scaled_manual_corners(self, frame: np.ndarray | None) -> list[float] | None:
+        manual = self._manual_corners()
+        if manual is None or frame is None:
+            return manual
+        ref_w = int(self.get_parameter('board_calibration_width').value)
+        ref_h = int(self.get_parameter('board_calibration_height').value)
+        if ref_w <= 0 or ref_h <= 0:
+            return manual
+        h, w = frame.shape[:2]
+        sx = w / float(ref_w)
+        sy = h / float(ref_h)
+        if abs(sx - 1.0) < 0.01 and abs(sy - 1.0) < 0.01:
+            return manual
+        if ref_w > 0 and ref_h > 0 and w < int(ref_w * 0.75):
+            self.get_logger().error(
+                f'Color frame {w}x{h} is smaller than calibration {ref_w}x{ref_h}. '
+                'RealSense likely fell back to 640x480 — restart launch so '
+                'realsense_camera.launch.py can apply 1280x720 profile.'
+            )
+        if abs(sx - sy) < 0.02:
+            scaled = [
+                manual[i] * (sx if i % 2 == 0 else sy)
+                for i in range(len(manual))
+            ]
+            mode = 'resize'
+        else:
+            # RealSense often center-crops when color profile falls back (16:9 -> 4:3).
+            scale = max(sx, sy)
+            crop_x = (ref_w * scale - w) / 2.0
+            crop_y = (ref_h * scale - h) / 2.0
+            scaled = []
+            for i, v in enumerate(manual):
+                if i % 2 == 0:
+                    scaled.append(v * scale - crop_x)
+                else:
+                    scaled.append(v * scale - crop_y)
+            mode = 'center-crop'
+        self.get_logger().warn(
+            f'Scaled board_manual_corners from {ref_w}x{ref_h} to frame {w}x{h} '
+            f'via {mode} (sx={sx:.3f}, sy={sy:.3f})',
+            throttle_duration_sec=30.0,
+        )
+        return scaled
 
     def _draw_occupancy_cells(self, image, cells: list[bool]):
         import cv2
@@ -278,7 +324,7 @@ class OccupancyNode(Node):
             frame,
             self.board_detector,
             self.piece_detector,
-            self._manual_corners(),
+            self._scaled_manual_corners(frame),
             depth_image=depth_frame,
             **self._scan_options(),
         )

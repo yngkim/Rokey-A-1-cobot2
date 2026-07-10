@@ -1,0 +1,18 @@
+{
+  "board_corners": [
+    866.0,
+    670.0,
+    770.0,
+    237.0,
+    238.0,
+    220.0,
+    103.0,
+    657.0
+  ],
+  "flip_files": false,
+  "board_flipped": false,
+  "webcam_device": 10,
+  "camera_width": 1280,
+  "camera_height": 720,
+  "_comment": "Order: a1, h1, h8, a8 image coordinates."
+}

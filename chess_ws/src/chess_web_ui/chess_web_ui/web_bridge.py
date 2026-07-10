@@ -5,12 +5,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any, Literal
 
 import chess
 import cv2
+import numpy as np
 import rclpy
 import uvicorn
 from chess_game.board_utils import occupancy_from_fen
@@ -32,20 +36,31 @@ from chess_web_ui.bot_banter import (
     react_to_illegal_move,
     react_to_illegal_move_reverted,
     react_to_player_move,
+    react_to_voice_ambiguous,
+    react_to_voice_confirm_fail,
+    react_to_voice_confirm_success,
     react_to_voice_empty,
     react_to_voice_illegal,
     react_to_voice_parse_error,
     react_to_voice_promotion_required,
+    react_to_voice_resign_fail,
+    react_to_voice_resign_success,
+    react_to_voice_restore_fail,
+    react_to_voice_restore_success,
     react_to_voice_success,
+    react_to_voice_undo_fail,
+    react_to_voice_undo_success,
 )
 from chess_web_ui.board_correct_utils import infer_human_move_uci
 from chess_web_ui.capture_utils import resolve_capture_symbol
+from chess_web_ui.voice_game_parser import parse_game_voice_command
 from chess_web_ui.voice_move_parser import (
     VoiceMoveParseError,
     VoiceMoveParseOk,
-    parse_voice_move,
+    parse_voice_command_with_meta,
     resolve_voice_move,
 )
+from chess_web_ui.voice_semantic_parser import validate_voice_move_intent
 from chess_web_ui.game_store import START_FEN, GameRecord, GameStore
 from chess_web_ui.graveyard_reconcile import reconcile_graveyards_with_fen
 from chess_web_ui.graveyard_utils import (
@@ -64,6 +79,17 @@ from chess_msgs.srv import (
     SetBoard,
     UndoMoves,
 )
+from chess_web_ui.board_twin.calibration import SideViewCalibration
+from chess_web_ui.board_twin.hand_presence import HandPresenceUpdate
+from chess_web_ui.board_twin.hand_service import HandDetectorService, HandServiceConfig
+from chess_web_ui.board_twin.side_service import draw_calibration_overlay
+from chess_web_ui.board_twin.engine import build_side_service_from_paths, run_board_twin_verify
+from chess_web_ui.board_twin.comparator import occupancy_diff_squares
+from chess_web_ui.board_twin.paths import (
+    default_hand_model_path,
+    default_side_model_path,
+    resolve_side_model_path,
+)
 from chess_web_ui.undo_utils import (
     build_undo_moves_payload,
     find_graveyard_slot_for_symbol,
@@ -75,12 +101,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
 
-BotStatus = Literal['idle', 'thinking', 'moving', 'error']
+BotStatus = Literal['idle', 'thinking', 'moving', 'paused', 'error']
 
 
 class MoveRequest(BaseModel):
@@ -93,6 +121,12 @@ class MoveRequest(BaseModel):
 class GameConfigRequest(BaseModel):
     human_color: str
     difficulty: str = 'medium'
+    board_orientation: str = 'standard'
+    hand_auto_confirm_enabled: bool | None = None
+
+
+class HandConfigRequest(BaseModel):
+    auto_confirm_enabled: bool
 
 
 class BoardCorrectRequest(BaseModel):
@@ -116,6 +150,33 @@ class VoiceMoveRequest(BaseModel):
     transcript: str
 
 
+class TwinVerifyRequest(BaseModel):
+    confirm_failed: bool = False
+    use_fresh_scan: bool = True
+
+
+class TwinConfigRequest(BaseModel):
+    enabled: bool
+
+
+class TwinCalibrationRequest(BaseModel):
+    board_corners: list[float]
+    flip_files: bool = False
+    board_flipped: bool = False
+
+
+def parse_auto_move_game_id(game_id: str) -> tuple[str, str]:
+    """Parse auto_move:uci or auto_move:uci##fen_before from GameSnapshot.game_id."""
+    raw = (game_id or '').strip()
+    if not raw.startswith('auto_move:'):
+        return '', ''
+    payload = raw[len('auto_move:'):].strip()
+    if '##' in payload:
+        uci, fen_before = payload.split('##', 1)
+        return uci.strip(), fen_before.strip()
+    return payload, ''
+
+
 class WebBridgeNode(Node):
     def __init__(self) -> None:
         super().__init__('chess_web_bridge')
@@ -127,10 +188,42 @@ class WebBridgeNode(Node):
         self.declare_parameter('camera_fallback_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('auto_bot_move', True)
         self.declare_parameter('human_color', 'white')
+        self.declare_parameter('board_orientation', 'standard')
         self.declare_parameter('engine_depth', 8)
         self.declare_parameter('difficulty', 'medium')
         self.declare_parameter('game_db_path', '~/.chess/games.db')
         self.declare_parameter('restore_saved_game', True)
+        self.declare_parameter('voice_llm_enabled', False)
+        self.declare_parameter('voice_llm_auto', True)
+        self.declare_parameter('voice_llm_model', 'llama3.2:3b')
+        self.declare_parameter('voice_llm_base_url', 'http://127.0.0.1:11434')
+        self.declare_parameter('twin_enabled', True)
+        self.declare_parameter('twin_auto_on_confirm_fail', True)
+        self.declare_parameter('twin_webcam_device', 10)
+        self.declare_parameter('twin_model_path', default_side_model_path())
+        self.declare_parameter('twin_calibration_path', '')
+        self.declare_parameter('twin_conf_threshold', 0.15)
+        self.declare_parameter('twin_iou_threshold', 0.5)
+        self.declare_parameter('twin_imgsz', 640)
+        self.declare_parameter('twin_device', '')
+        self.declare_parameter('twin_webcam_fps', 30)
+        self.declare_parameter('twin_preview_interval_sec', 0.1)
+        self.declare_parameter('twin_inference_interval_sec', 0.5)
+        self.declare_parameter('twin_sideview_topic', '')
+        self.declare_parameter('hand_enabled', True)
+        try:
+            _default_hand_model = default_hand_model_path()
+        except FileNotFoundError:
+            _default_hand_model = ''
+        self.declare_parameter('hand_model_path', _default_hand_model)
+        self.declare_parameter('hand_conf_threshold', 0.35)
+        self.declare_parameter('hand_inference_interval_sec', 0.1)
+        self.declare_parameter('hand_auto_confirm_enabled', False)
+        self.declare_parameter('hand_safety_enabled', True)
+        self.declare_parameter('hand_gone_confirm_delay_sec', 0.35)
+        self.declare_parameter('hand_absent_frames', 4)
+        self.declare_parameter('hand_confirm_cooldown_sec', 1.0)
+        self.declare_parameter('hand_board_margin_px', 20.0)
 
         self.latest_fen = START_FEN
         self.latest_occupancy = [False] * 64
@@ -158,6 +251,59 @@ class WebBridgeNode(Node):
         self._undo_snapshots: list[dict[str, Any]] = []
         self._pending_promotion: dict[str, str] | None = None
         self._pending_illegal_move: dict[str, str] | None = None
+        self._latest_twin_report: dict[str, Any] | None = None
+        self._twin_side_service = None
+        self._sideview_lock = threading.Lock()
+        self._sideview_live_jpeg: bytes | None = None
+        self._sideview_piece_map: dict[str, str] = {}
+        self._sideview_occupancy: list[bool] = [False] * 64
+        self._sideview_message = ''
+        self._sideview_preview_error = ''
+        self._sideview_detections: list[dict[str, Any]] = []
+        self._sideview_latest_frame: np.ndarray | None = None
+        self._sideview_latest_frame_at = 0.0
+        self._sideview_inference_busy = False
+        self._sideview_updated_at = 0.0
+        self._preview_updated_at = 0.0
+        self._side_webcam_open_logged = False
+        self._twin_runtime_lock = threading.Lock()
+        self._twin_runtime_enabled = False
+        self._hand_service = None
+        self._hand_lock = threading.Lock()
+        self._hand_in_board = False
+        self._hand_raw_in_board = False
+        self._hand_seen = False
+        self._hand_present = False
+        self._hand_inference_busy = False
+        self._hand_raw_in_board_prev = False
+        self._hand_safety_paused = False
+        self._bot_status_before_pause: BotStatus = 'idle'
+        self._hand_left_at = 0.0
+        self._hand_confirm_pending = False
+        self._hand_confirm_in_progress = False
+        self._hand_confirm_timer = None
+        self._last_hand_confirm_at = 0.0
+        self._last_auto_move_uci = ''
+        self._last_auto_move_at = 0.0
+        self._auto_move_lock = threading.Lock()
+        self._pending_vision_auto_move: tuple[str, str, str] | None = None
+        self._vision_auto_move_in_progress = False
+        self._last_bot_resume_attempt_at = 0.0
+        self._hand_last_published_in_board: bool | None = None
+        self._bot_activity_started_at = 0.0
+        self._hand_jpeg: bytes | None = None
+        self._hand_preview_error = ''
+        self._hand_detection_count = 0
+        self._hand_updated_at = 0.0
+        self._hand_auto_confirm_runtime = bool(
+            self.get_parameter('hand_auto_confirm_enabled').value
+        )
+        self._restore_in_progress = False
+        self._board_reset_in_progress = False
+        self._active_move_goal_handle = None
+        self._active_restore_goal_handle = None
+        self._executor: MultiThreadedExecutor | None = None
+        self._service_call_lock = threading.Lock()
         self._active_game_id = ''
         db_path = str(self.get_parameter('game_db_path').value)
         self._game_store = GameStore(db_path)
@@ -170,6 +316,9 @@ class WebBridgeNode(Node):
         self._bot_lock = threading.Lock()
         self._bot_busy = False
         self._bot_pending_fen = ''
+        self._bot_worker_thread: threading.Thread | None = None
+        self._bot_cancel_requested = False
+        self._bot_session_active = False
         self._engine_lock = threading.Lock()
         engine_depth = int(self.get_parameter('engine_depth').value)
         self._engine = StockfishClient(depth=engine_depth)
@@ -178,13 +327,53 @@ class WebBridgeNode(Node):
         self.create_subscription(GameSnapshot, 'chess/game_snapshot', self._on_snapshot, 10)
         self.create_subscription(BoardState, 'chess/board_state', self._on_board, 10)
         self.create_subscription(BoardState, 'vision/live_occupancy', self._on_live_occupancy, 10)
+        self._hand_pub = self.create_publisher(Bool, 'chess/hand_in_board', 10)
+        self._timer_cb_group = ReentrantCallbackGroup()
+        self._inference_lock = threading.Lock()
         if bool(self.get_parameter('enable_camera_preview').value):
             topic = str(self.get_parameter('camera_preview_topic').value)
             self.create_subscription(Image, topic, self._on_preview_image, 10)
-            fallback = str(self.get_parameter('camera_fallback_topic').value)
-            self.create_subscription(Image, fallback, self._on_fallback_camera, 10)
+            self.get_logger().info(f'Camera preview: {topic}')
+        preview_interval = float(self.get_parameter('twin_preview_interval_sec').value)
+        if self._twin_enabled() or self._hand_enabled():
+            self.create_timer(
+                preview_interval,
+                self._timer_sideview_preview,
+                callback_group=self._timer_cb_group,
+            )
+            self.get_logger().info(f'Side webcam preview every {preview_interval}s')
+        if self._twin_enabled():
+            infer_interval = float(self.get_parameter('twin_inference_interval_sec').value)
+            self.create_timer(
+                infer_interval,
+                self._timer_sideview_inference,
+                callback_group=self._timer_cb_group,
+            )
+            side_topic = str(self.get_parameter('twin_sideview_topic').value).strip()
+            if side_topic:
+                self.create_subscription(Image, side_topic, self._on_sideview_topic, 10)
             self.get_logger().info(
-                f'Camera preview: {topic} (fallback {fallback})'
+                f'Side-view twin inference every {infer_interval}s, '
+                f'topic fallback={side_topic or "none"}'
+            )
+        if self._hand_enabled():
+            hand_interval = float(self.get_parameter('hand_inference_interval_sec').value)
+            self.create_timer(
+                hand_interval,
+                self._timer_hand_inference,
+                callback_group=self._timer_cb_group,
+            )
+            self.create_timer(
+                0.2,
+                self._timer_hand_auto_confirm_poll,
+                callback_group=self._timer_cb_group,
+            )
+            self.get_logger().info(f'Hand detection every {hand_interval}s')
+        if self._vision_mode():
+            self.create_timer(
+                0.2,
+                self._timer_game_flow_poll,
+                callback_group=self._timer_cb_group,
             )
         self.reset_client = self.create_client(ResetBoard, 'chess/reset_board')
         self.scan_initial_client = self.create_client(ScanInitial, 'chess/scan_initial')
@@ -203,7 +392,755 @@ class WebBridgeNode(Node):
             self._restore_timer = self.create_timer(4.0, self._try_restore_saved_game)
 
     def shutdown(self) -> None:
+        if self._twin_side_service is not None:
+            self._twin_side_service.release()
         self._engine.stop()
+
+    def _resolve_twin_calibration_path(self) -> str:
+        configured = str(self.get_parameter('twin_calibration_path').value).strip()
+        if configured:
+            return configured
+        candidates: list[Path] = []
+        try:
+            from ament_index_python.packages import get_package_share_directory
+
+            share = Path(get_package_share_directory('chess_web_ui'))
+            candidates.append(share / 'config' / 'board_twin_side_calibration.json')
+        except Exception:  # noqa: BLE001
+            pass
+        module_dir = Path(__file__).resolve().parent
+        candidates.append(module_dir.parent / 'config' / 'board_twin_side_calibration.json')
+        for path in candidates:
+            if path.is_file():
+                return str(path)
+        searched = ', '.join(str(path) for path in candidates)
+        raise FileNotFoundError(
+            f'board twin calibration not found (searched: {searched}). '
+            'Run: colcon build --packages-select chess_web_ui'
+        )
+
+    def _default_twin_calibration_path(self) -> str:
+        return self._resolve_twin_calibration_path()
+
+    def _twin_enabled(self) -> bool:
+        return bool(self.get_parameter('twin_enabled').value)
+
+    def _hand_enabled(self) -> bool:
+        return bool(self.get_parameter('hand_enabled').value)
+
+    def _hand_active(self) -> bool:
+        return self._hand_enabled()
+
+    def _side_webcam_preview_active(self) -> bool:
+        return self._hand_active() or self._twin_active()
+
+    def _side_webcam_available(self) -> bool:
+        return self._twin_enabled() or self._hand_enabled()
+
+    def is_hand_auto_confirm_enabled(self) -> bool:
+        return self._hand_auto_confirm_runtime
+
+    def set_hand_auto_confirm_enabled(self, enabled: bool) -> None:
+        self._hand_auto_confirm_runtime = bool(enabled)
+
+    def _get_hand_service(self) -> HandDetectorService:
+        if self._hand_service is not None:
+            return self._hand_service
+        calibration_path = self._default_twin_calibration_path()
+        configured_model = str(self.get_parameter('hand_model_path').value)
+        self._hand_service = HandDetectorService(
+            HandServiceConfig(
+                model_path=configured_model,
+                calibration_path=calibration_path,
+                conf_threshold=float(self.get_parameter('hand_conf_threshold').value),
+                board_margin_px=float(self.get_parameter('hand_board_margin_px').value),
+                absent_frames=int(self.get_parameter('hand_absent_frames').value),
+            )
+        )
+        return self._hand_service
+
+    def _publish_hand_in_board(self, in_board: bool, *, force: bool = False) -> None:
+        if not force and self._hand_last_published_in_board is in_board:
+            return
+        msg = Bool()
+        msg.data = bool(in_board)
+        self._hand_pub.publish(msg)
+        self._hand_last_published_in_board = bool(in_board)
+
+    def _republish_hand_clear_if_robot_active(
+        self,
+        *,
+        in_board: bool,
+        raw_in_board: bool,
+    ) -> None:
+        """Caller must not hold _hand_lock (or must pass state read under the lock)."""
+        if not self._hand_enabled():
+            return
+        if in_board or raw_in_board:
+            return
+        if self.bot_status in ('moving', 'paused') or self._hand_safety_paused:
+            self._publish_hand_in_board(False, force=True)
+
+    def _ensure_hand_clear_for_robot(self) -> None:
+        """Re-send hand-cleared while the arm may be blocked on SafetyGate."""
+        with self._hand_lock:
+            in_board = self._hand_in_board
+            raw_in_board = self._hand_raw_in_board
+        self._republish_hand_clear_if_robot_active(
+            in_board=in_board,
+            raw_in_board=raw_in_board,
+        )
+
+    def _recover_stale_bot_activity(self) -> bool:
+        """Reset stuck bot UI/worker flags so the next bot move can start."""
+        stale_status = self.bot_status in ('thinking', 'moving', 'paused')
+        with self._bot_lock:
+            busy = self._bot_busy
+            worker = self._bot_worker_thread
+        worker_alive = worker is not None and worker.is_alive()
+        orphan_busy = busy and not worker_alive
+        timed_out = (
+            self._bot_activity_started_at > 0.0
+            and time.time() - self._bot_activity_started_at > 30.0
+        )
+        should_recover = orphan_busy or (stale_status and not worker_alive) or (
+            busy and timed_out
+        ) or (stale_status and timed_out)
+        if not should_recover:
+            return False
+        if busy and worker_alive and not timed_out and not stale_status:
+            return False
+        self.get_logger().warn(
+            f'recovering stale bot activity status={self.bot_status} busy={busy}'
+        )
+        with self._bot_lock:
+            self._bot_busy = False
+            self._bot_pending_fen = ''
+        self._hand_safety_paused = False
+        self._bot_activity_started_at = 0.0
+        self.bot_status = 'idle'
+        self._ensure_hand_clear_for_robot()
+        return True
+
+    def _update_hand_safety(self, hand_in_board: bool) -> None:
+        if not bool(self.get_parameter('hand_safety_enabled').value):
+            return
+        robot_active = self.bot_status in ('moving', 'paused') or self._restore_in_progress
+        if hand_in_board and robot_active and not self._hand_safety_paused:
+            self._hand_safety_paused = True
+            if self.bot_status != 'paused':
+                self._bot_status_before_pause = self.bot_status
+            self.bot_status = 'paused'
+            self.get_logger().info('hand on board — robot paused for safety')
+        elif not hand_in_board and self._hand_safety_paused:
+            self._hand_safety_paused = False
+            if self._restore_in_progress or self._bot_busy:
+                self.bot_status = 'moving'
+            else:
+                self.bot_status = self._bot_status_before_pause or 'idle'
+            self.get_logger().info('hand cleared — robot safety pause released')
+            self._try_process_pending_vision_auto_move()
+            self._maybe_resume_bot_after_player_move()
+
+    def _schedule_hand_auto_confirm(self) -> None:
+        if not self._hand_auto_confirm_runtime:
+            return
+        if self.game_phase != 'playing':
+            return
+        if not self._is_human_turn(self.latest_white_to_move):
+            return
+        if self._bot_busy or self._hand_confirm_in_progress:
+            self._recover_stale_bot_activity()
+            if self._bot_busy or self._hand_confirm_in_progress:
+                return
+        cooldown = float(self.get_parameter('hand_confirm_cooldown_sec').value)
+        if time.time() - self._last_hand_confirm_at < cooldown:
+            return
+        self._hand_confirm_pending = True
+
+    def _maybe_run_hand_auto_confirm(self) -> None:
+        if not self._hand_confirm_pending:
+            return
+        delay = float(self.get_parameter('hand_gone_confirm_delay_sec').value)
+        if self._hand_left_at <= 0.0:
+            return
+        if time.time() - self._hand_left_at < delay:
+            return
+        if self._hand_in_board or self._hand_raw_in_board:
+            self._hand_confirm_pending = False
+            return
+        self._hand_confirm_pending = False
+        self._hand_confirm_in_progress = True
+        self._last_hand_confirm_at = time.time()
+        self.get_logger().info('hand left board — auto confirm_player_move')
+        if self._hand_confirm_timer is not None:
+            try:
+                self._hand_confirm_timer.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        self._hand_confirm_timer = self.create_timer(0.05, self._execute_hand_auto_confirm)
+
+    def _execute_hand_auto_confirm(self) -> None:
+        if self._hand_confirm_timer is not None:
+            try:
+                self._hand_confirm_timer.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            self._hand_confirm_timer = None
+
+        def _run() -> None:
+            try:
+                success, message, from_sq, to_sq = self.confirm_player_move()
+                self.get_logger().info(
+                    f'hand auto confirm: success={success} {from_sq}->{to_sq} msg={message}'
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'hand auto confirm failed: {exc}')
+            finally:
+                self._hand_confirm_in_progress = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _store_hand_preview(self, service: HandDetectorService, frame, update) -> None:
+        try:
+            annotated = service.annotate_frame(frame, update.detections)
+            preview = draw_calibration_overlay(annotated, service.calibration.board_corners)
+            state = 'IN BOARD' if update.hand_in_board else (
+                'ENTERING' if any(det.in_board_roi for det in update.detections) else (
+                    'NEAR' if update.hand_present else ('SEEN' if update.hand_seen else 'CLEAR')
+                )
+            )
+            cv2.putText(
+                preview,
+                f'hand: {state}  auto={self._hand_auto_confirm_runtime}',
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0) if update.hand_in_board else (200, 200, 200),
+                2,
+                cv2.LINE_AA,
+            )
+            ok, encoded = cv2.imencode('.jpg', preview, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
+                with self._hand_lock:
+                    self._hand_preview_error = 'hand jpeg encode failed'
+                return
+            with self._hand_lock:
+                self._hand_jpeg = encoded.tobytes()
+                self._hand_detection_count = len(update.detections)
+                self._hand_preview_error = ''
+        except Exception as exc:  # noqa: BLE001
+            with self._hand_lock:
+                self._hand_preview_error = str(exc)
+
+    def _capture_fresh_side_frame(self) -> np.ndarray | None:
+        """Always read the side webcam directly — never reuse a stale cached frame."""
+        if not self._side_webcam_available():
+            return None
+        service = self._get_twin_side_service()
+        if service is None:
+            return None
+        frame = service.capture_webcam_frame()
+        if frame is None or frame.size == 0:
+            return None
+        now = time.time()
+        with self._sideview_lock:
+            self._sideview_latest_frame = frame.copy()
+            self._sideview_latest_frame_at = now
+        if not self._side_webcam_open_logged and self._twin_side_service is not None:
+            webcam = getattr(self._twin_side_service, '_webcam', None)
+            if webcam is not None and webcam.active_device is not None:
+                self._side_webcam_open_logged = True
+                self.get_logger().info(
+                    f'side webcam active: /dev/video{webcam.active_device} '
+                    f'{webcam.actual_width}x{webcam.actual_height}@{webcam.actual_fps:.0f}fps'
+                )
+        return frame
+
+    def _capture_hand_frame(self) -> np.ndarray | None:
+        return self._get_side_frame_for_inference()
+
+    def _get_side_frame_for_inference(self, *, max_age_sec: float = 0.5) -> np.ndarray | None:
+        """Reuse the latest preview frame when fresh to avoid triple webcam reads."""
+        with self._sideview_lock:
+            frame = self._sideview_latest_frame
+            captured_at = self._sideview_latest_frame_at
+        if frame is not None and frame.size > 0 and time.time() - captured_at <= max_age_sec:
+            return frame.copy()
+        return self._capture_fresh_side_frame()
+
+    def _hand_leave_event(self, *, raw_in_board: bool) -> None:
+        if self._hand_raw_in_board_prev and not raw_in_board:
+            self._hand_left_at = time.time()
+            self._schedule_hand_auto_confirm()
+        self._hand_raw_in_board_prev = raw_in_board
+
+    def _apply_hand_update(self, service: HandDetectorService, frame, update) -> None:
+        raw_in_board = any(det.in_board_roi for det in update.detections)
+        self._store_hand_preview(service, frame, update)
+        with self._hand_lock:
+            prev_in_board = self._hand_in_board
+            self._hand_in_board = update.hand_in_board
+            self._hand_raw_in_board = raw_in_board
+            self._hand_seen = update.hand_seen
+            self._hand_present = update.hand_present
+            self._hand_updated_at = time.time()
+            if raw_in_board or update.hand_in_board:
+                self._hand_confirm_pending = False
+            if update.entered_board:
+                self._hand_confirm_pending = False
+            if update.left_board:
+                self._hand_left_at = time.time()
+                self._schedule_hand_auto_confirm()
+            self._hand_leave_event(raw_in_board=raw_in_board)
+            if prev_in_board != self._hand_in_board:
+                self._publish_hand_in_board(self._hand_in_board)
+            elif not raw_in_board and not update.hand_in_board:
+                self._republish_hand_clear_if_robot_active(
+                    in_board=self._hand_in_board,
+                    raw_in_board=raw_in_board,
+                )
+        self._update_hand_safety(update.hand_in_board)
+        self._maybe_run_hand_auto_confirm()
+
+    def _refresh_hand_preview_from_frame(self, frame: np.ndarray) -> None:
+        """Update hand annotated JPEG from the latest side frame + cached detections."""
+        if not self._hand_active():
+            return
+        try:
+            service = self._get_hand_service()
+            tracker = service.tracker
+            dets = list(tracker._last_detections)
+            raw_in_board = any(det.in_board_roi for det in dets)
+            preview_update = HandPresenceUpdate(
+                state=tracker.state,
+                hand_in_board=tracker.hand_in_board,
+                hand_seen=bool(dets),
+                hand_present=bool(dets) and not raw_in_board,
+                detections=dets,
+            )
+            self._store_hand_preview(service, frame, preview_update)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f'hand preview refresh failed: {exc}',
+                throttle_duration_sec=10.0,
+            )
+
+    def _hand_inference_capture_failed(self, err: str) -> None:
+        with self._hand_lock:
+            self._hand_updated_at = time.time()
+        self.get_logger().warn(f'hand capture failed: {err}', throttle_duration_sec=5.0)
+
+    def _timer_game_flow_poll(self) -> None:
+        self._try_process_pending_vision_auto_move()
+        self._maybe_resume_bot_after_player_move()
+
+    def _timer_hand_auto_confirm_poll(self) -> None:
+        self._ensure_hand_clear_for_robot()
+        self._try_process_pending_vision_auto_move()
+        self._maybe_resume_bot_after_player_move()
+        if self._hand_auto_confirm_runtime:
+            self._maybe_run_hand_auto_confirm()
+        if not self._hand_active():
+            return
+        with self._hand_lock:
+            last = self._hand_updated_at
+        now = time.time()
+        with self._sideview_lock:
+            preview_at = self._preview_updated_at
+        preview_stale = preview_at <= 0.0 or now - preview_at > 5.0
+        hand_stale = last > 0.0 and now - last > 5.0
+        if (
+            hand_stale
+            and preview_stale
+            and not self._hand_inference_busy
+        ):
+            self.get_logger().warn(
+                'hand pipeline stale >5s — reopening side webcam',
+                throttle_duration_sec=15.0,
+            )
+            if self._twin_side_service is not None:
+                self._twin_side_service.release()
+                self._twin_side_service = None
+
+    def _timer_hand_inference(self) -> None:
+        if not self._hand_active() or self._hand_inference_busy:
+            return
+        self._hand_inference_busy = True
+
+        def _run() -> None:
+            try:
+                service = self._get_hand_service()
+                frame = self._capture_hand_frame()
+                if frame is None or frame.size == 0:
+                    err = ''
+                    if self._twin_side_service is not None:
+                        err = self._twin_side_service.webcam_last_error()
+                    self._hand_inference_capture_failed(err or 'side webcam capture failed')
+                    return
+                with self._inference_lock:
+                    update = service.update_from_frame(frame)
+                self._apply_hand_update(service, frame, update)
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'hand inference error: {exc}')
+            finally:
+                self._hand_inference_busy = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _twin_active(self) -> bool:
+        with self._twin_runtime_lock:
+            return self._twin_enabled() and self._twin_runtime_enabled
+
+    def is_twin_runtime_enabled(self) -> bool:
+        with self._twin_runtime_lock:
+            return self._twin_runtime_enabled
+
+    def set_twin_runtime_enabled(self, enabled: bool) -> None:
+        with self._twin_runtime_lock:
+            self._twin_runtime_enabled = bool(enabled)
+        if not enabled:
+            self._release_twin_resources()
+        else:
+            self._warm_sideview()
+        self.get_logger().info(f'sideview twin runtime enabled={enabled}')
+
+    def save_side_calibration(
+        self,
+        board_corners: list[float],
+        *,
+        flip_files: bool = False,
+        board_flipped: bool = False,
+    ) -> tuple[bool, str]:
+        if len(board_corners) != 8:
+            return False, 'board_corners must have 8 numbers (a1,h1,h8,a8)'
+        path = self._default_twin_calibration_path()
+        payload = {
+            'board_corners': [float(v) for v in board_corners],
+            'flip_files': bool(flip_files),
+            'board_flipped': bool(board_flipped),
+            'webcam_device': int(self.get_parameter('twin_webcam_device').value),
+            'camera_width': 1280,
+            'camera_height': 720,
+            '_comment': 'Order: a1, h1, h8, a8 image coordinates.',
+        }
+        Path(path).write_text(json.dumps(payload, indent=2) + '\n', encoding='utf-8')
+        if self._twin_side_service is not None:
+            self._twin_side_service.calibration = SideViewCalibration.from_json_file(path)
+        if self._hand_service is not None:
+            self._hand_service.reload_calibration()
+        self._warm_sideview()
+        return True, f'saved side calibration to {path}'
+
+    def _warm_sideview(self) -> None:
+        if not self._twin_active():
+            return
+        self._timer_sideview_preview()
+        if not self._sideview_inference_busy:
+            self._timer_sideview_inference()
+
+    def get_side_calibration_payload(self) -> dict[str, Any]:
+        path = self._default_twin_calibration_path()
+        cal = SideViewCalibration.from_json_file(path)
+        return {
+            'calibration_path': path,
+            'board_corners': [coord for point in cal.board_corners for coord in point],
+            'flip_files': cal.flip_files,
+            'board_flipped': cal.board_flipped,
+            'webcam_device': cal.webcam_device,
+            'camera_width': cal.camera_width,
+            'camera_height': cal.camera_height,
+        }
+
+    def _release_twin_resources(self) -> None:
+        # Hand detection shares the side webcam — never release while hand is active.
+        if not self._hand_active() and self._twin_side_service is not None:
+            self._twin_side_service.release()
+            self._twin_side_service = None
+        with self._sideview_lock:
+            self._sideview_live_jpeg = None
+            self._sideview_piece_map = {}
+            self._sideview_occupancy = [False] * 64
+            self._sideview_message = ''
+            self._sideview_preview_error = ''
+            self._sideview_detections = []
+            self._sideview_latest_frame = None
+            self._sideview_latest_frame_at = 0.0
+            self._sideview_updated_at = 0.0
+            self._preview_updated_at = 0.0
+
+    def _apply_sideview_estimate(
+        self,
+        estimate: Any,
+        annotated: np.ndarray | None,
+        msg: str,
+    ) -> None:
+        del annotated
+        with self._sideview_lock:
+            if estimate is not None:
+                self._sideview_piece_map = dict(estimate.piece_map)
+                self._sideview_occupancy = list(estimate.occupancy)
+                self._sideview_detections = [
+                    {
+                        'class_name': det.class_name,
+                        'symbol': det.symbol,
+                        'square': det.square,
+                        'confidence': det.confidence,
+                        'center_x': det.center_x,
+                        'center_y': det.center_y,
+                        'bbox': list(det.bbox),
+                    }
+                    for det in estimate.detections
+                ]
+                self._sideview_message = msg or estimate.message
+            else:
+                self._sideview_message = msg or 'sideview inference failed'
+            self._sideview_updated_at = time.time()
+
+    def _get_twin_side_service(self):
+        if self._twin_side_service is not None:
+            return self._twin_side_service
+        if not self._side_webcam_available():
+            return None
+        calibration_path = self._default_twin_calibration_path()
+        configured_model = str(self.get_parameter('twin_model_path').value)
+        model_path = resolve_side_model_path(configured_model)
+        if model_path != configured_model:
+            self.get_logger().info(f'sideview model: {model_path}')
+        elif not Path(model_path).is_file() and '/' in model_path:
+            self.get_logger().warn(
+                f'sideview model {model_path} not found locally; using remote/HF resolve'
+            )
+        self._twin_side_service = build_side_service_from_paths(
+            model_path=model_path,
+            calibration_path=calibration_path,
+            conf_threshold=float(self.get_parameter('twin_conf_threshold').value),
+            iou_threshold=float(self.get_parameter('twin_iou_threshold').value),
+            imgsz=int(self.get_parameter('twin_imgsz').value),
+            device=str(self.get_parameter('twin_device').value),
+            webcam_fps=int(self.get_parameter('twin_webcam_fps').value),
+        )
+        device = int(self.get_parameter('twin_webcam_device').value)
+        self._twin_side_service.calibration.webcam_device = device
+        self.get_logger().info(
+            f'side webcam configured: /dev/video{device} (C270 side cam expected at 10; laptop cam is 8)'
+        )
+        return self._twin_side_service
+
+    def _timer_sideview_preview(self) -> None:
+        if not self._side_webcam_preview_active():
+            return
+        try:
+            service = self._get_twin_side_service()
+            if service is None:
+                return
+            frame = self._capture_fresh_side_frame()
+            if frame is None:
+                err = service.webcam_last_error() or 'side webcam capture failed'
+                with self._sideview_lock:
+                    self._sideview_preview_error = err
+                return
+            preview_frame = draw_calibration_overlay(frame, service.calibration.board_corners)
+            stamp = time.strftime('%H:%M:%S') + f'.{int(time.time() * 10) % 10}'
+            cv2.putText(
+                preview_frame,
+                f'live {stamp}',
+                (8, 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+            ok, encoded = cv2.imencode('.jpg', preview_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            if not ok:
+                with self._sideview_lock:
+                    self._sideview_preview_error = 'webcam jpeg encode failed'
+                return
+            with self._sideview_lock:
+                self._sideview_live_jpeg = encoded.tobytes()
+                self._sideview_preview_error = ''
+                self._preview_updated_at = time.time()
+            if self._hand_active():
+                self._refresh_hand_preview_from_frame(frame)
+        except Exception as exc:  # noqa: BLE001
+            with self._sideview_lock:
+                self._sideview_preview_error = str(exc)
+            self.get_logger().warn(
+                f'sideview preview failed: {exc}',
+                throttle_duration_sec=10.0,
+            )
+
+    def _on_sideview_topic(self, msg: Image) -> None:
+        if not self._twin_active():
+            return
+        try:
+            frame = self._preview_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            ok, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not ok:
+                return
+            with self._sideview_lock:
+                self._sideview_live_jpeg = encoded.tobytes()
+                self._sideview_preview_error = ''
+                self._preview_updated_at = time.time()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(
+                f'sideview topic preview failed: {exc}',
+                throttle_duration_sec=10.0,
+            )
+
+    def _timer_sideview_inference(self) -> None:
+        if not self._twin_active() or self._sideview_inference_busy:
+            return
+        self._sideview_inference_busy = True
+
+        def _run() -> None:
+            started = time.monotonic()
+            estimate = None
+            try:
+                service = self._get_twin_side_service()
+                frame = self._get_side_frame_for_inference()
+                if frame is None:
+                    err = service.webcam_last_error() if service else 'no sideview frame for inference'
+                    err = err or 'no sideview frame for inference'
+                    self._apply_sideview_estimate(None, None, err)
+                    return
+                with self._inference_lock:
+                    estimate, _raw, _annotated, msg = service.detect_and_annotate_from_frame(
+                        frame,
+                        recorded_fen=self.latest_fen,
+                    )
+                self._apply_sideview_estimate(estimate, None, msg)
+                elapsed = time.monotonic() - started
+                det_count = len(estimate.detections) if estimate is not None else 0
+                raw_count = len(_raw) if _raw else 0
+                self.get_logger().info(
+                    f'sideview inference {elapsed:.2f}s, '
+                    f'{raw_count} raw / {det_count} mapped detections'
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._apply_sideview_estimate(
+                    estimate,
+                    None,
+                    f'sideview inference error: {exc}',
+                )
+                self.get_logger().error(f'sideview inference failed: {exc}')
+            finally:
+                self._sideview_inference_busy = False
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def get_sideview_jpeg(self) -> bytes | None:
+        with self._sideview_lock:
+            return self._sideview_live_jpeg
+
+    def get_hand_preview_jpeg(self) -> bytes | None:
+        with self._hand_lock:
+            return self._hand_jpeg
+
+    def get_twin_live_payload(self) -> dict[str, Any]:
+        available = self._twin_enabled()
+        runtime_enabled = self.is_twin_runtime_enabled()
+        with self._hand_lock:
+            hand_in_board = self._hand_in_board
+            hand_seen = self._hand_seen
+            hand_present = self._hand_present
+            hand_safety_paused = self._hand_safety_paused
+            hand_preview_available = self._hand_jpeg is not None
+            hand_preview_error = self._hand_preview_error
+            hand_detection_count = self._hand_detection_count
+            hand_updated_at = self._hand_updated_at
+        hand_available = self._hand_enabled()
+        hand_fields = {
+            'hand_available': hand_available,
+            'hand_in_board': hand_in_board if hand_available else False,
+            'hand_seen': hand_seen if hand_available else False,
+            'hand_present': hand_present if hand_available else False,
+            'hand_safety_paused': hand_safety_paused if hand_available else False,
+            'hand_auto_confirm_enabled': self._hand_auto_confirm_runtime,
+            'hand_preview_available': hand_preview_available if hand_available else False,
+            'hand_preview_error': hand_preview_error if hand_available else '',
+            'hand_detection_count': hand_detection_count if hand_available else 0,
+            'hand_updated_at': hand_updated_at if hand_available else 0.0,
+        }
+        if not available or not runtime_enabled:
+            with self._sideview_lock:
+                preview_updated_at = self._preview_updated_at
+                preview_error = self._sideview_preview_error
+                preview_available = self._sideview_live_jpeg is not None
+            return {
+                'enabled': False,
+                'available': available,
+                'runtime_enabled': runtime_enabled,
+                'preview_available': preview_available if hand_available else False,
+                'preview_error': preview_error if hand_available else '',
+                'preview_updated_at': preview_updated_at if hand_available else 0.0,
+                **hand_fields,
+            }
+        recorded_occ = list(self.latest_occupancy)
+        with self._sideview_lock:
+            sv_occ = list(self._sideview_occupancy)
+            sv_map = dict(self._sideview_piece_map)
+            sv_dets = list(self._sideview_detections)
+            msg = self._sideview_message
+            preview_error = self._sideview_preview_error
+            preview_available = self._sideview_live_jpeg is not None
+            updated_at = self._sideview_updated_at
+            preview_updated_at = self._preview_updated_at
+        return {
+            'enabled': True,
+            'available': True,
+            'runtime_enabled': True,
+            'recorded_occupancy': recorded_occ,
+            'sideview_occupancy': sv_occ,
+            'sideview_piece_map': sv_map,
+            'sideview_detections': sv_dets,
+            'diff_squares': occupancy_diff_squares(recorded_occ, sv_occ),
+            'message': msg,
+            'preview_available': preview_available,
+            'preview_error': preview_error,
+            'sideview_updated_at': updated_at,
+            'preview_updated_at': preview_updated_at,
+            **hand_fields,
+        }
+
+    def verify_board_twin(
+        self,
+        *,
+        confirm_failed: bool = False,
+        use_fresh_scan: bool = True,
+    ) -> dict[str, Any]:
+        del use_fresh_scan
+        if not self._twin_enabled():
+            payload = {
+                'success': False,
+                'aligned': False,
+                'message': 'board twin verification is disabled',
+                'recorded_fen': self.latest_fen,
+            }
+            self._latest_twin_report = payload
+            return payload
+        if not self._twin_active():
+            payload = {
+                'success': False,
+                'aligned': True,
+                'message': '사이드뷰 보드 검증이 꺼져 있습니다',
+                'recorded_fen': self.latest_fen,
+            }
+            self._latest_twin_report = payload
+            return payload
+
+        result = run_board_twin_verify(
+            recorded_fen=self.latest_fen,
+            side_service=self._get_twin_side_service(),
+            confirm_failed=confirm_failed,
+        )
+        payload = result.to_payload()
+        self._latest_twin_report = payload
+        self.get_logger().info(
+            f'board twin verify aligned={result.aligned} mismatches={len(result.mismatches)}'
+        )
+        return payload
 
     def _vision_mode(self) -> bool:
         return bool(self.get_parameter('vision_mode').value)
@@ -215,12 +1152,47 @@ class WebBridgeNode(Node):
         color = str(self.get_parameter('human_color').value).strip().lower()
         return color if color in {'white', 'black'} else 'white'
 
+    def _board_orientation(self) -> str:
+        orientation = str(self.get_parameter('board_orientation').value).strip().lower()
+        return orientation if orientation in {'standard', 'flipped'} else 'standard'
+
     def _robot_color(self) -> str:
         return 'black' if self._human_color() == 'white' else 'white'
 
     def _is_robot_turn(self, white_to_move: bool) -> bool:
         robot_is_white = self._human_color() == 'black'
         return white_to_move == robot_is_white
+
+    def _is_human_turn(self, white_to_move: bool) -> bool:
+        return not self._is_robot_turn(white_to_move)
+
+    def _voice_llm_enabled(self) -> bool:
+        return bool(self.get_parameter('voice_llm_enabled').value)
+
+    def _voice_llm_auto(self) -> bool:
+        return bool(self.get_parameter('voice_llm_auto').value)
+
+    def _voice_llm_model(self) -> str:
+        return str(self.get_parameter('voice_llm_model').value).strip() or 'llama3.2:3b'
+
+    def _voice_llm_base_url(self) -> str:
+        return str(self.get_parameter('voice_llm_base_url').value).strip() or 'http://127.0.0.1:11434'
+
+    def _uci_is_human_move(self, fen: str, uci: str) -> bool:
+        uci = (uci or '').strip().lower()
+        if len(uci) < 4:
+            return False
+        from_sq = uci[:2]
+        try:
+            board = chess.Board(fen)
+            square = chess.parse_square(from_sq)
+        except ValueError:
+            return False
+        piece = board.piece_at(square)
+        if piece is None:
+            return False
+        human_is_white = self._human_color() == 'white'
+        return piece.color == chess.WHITE if human_is_white else piece.color == chess.BLACK
 
     @staticmethod
     def _is_illegal_move_result(result, *, legal: bool, uci: str) -> bool:
@@ -231,7 +1203,7 @@ class WebBridgeNode(Node):
 
     def _difficulty(self) -> Difficulty:
         level = str(self.get_parameter('difficulty').value).strip().lower()
-        if level in {'easy', 'medium', 'hard'}:
+        if level in {'beginner', 'easy', 'medium', 'hard', 'master'}:
             return level  # type: ignore[return-value]
         return 'medium'
 
@@ -262,9 +1234,25 @@ class WebBridgeNode(Node):
     def _is_legal_uci(self, fen: str, uci: str) -> bool:
         return resolve_legal_uci_full(uci, fen) is not None
 
-    def _with_engine(self, fn):
-        with self._engine_lock:
-            return fn()
+    def _with_engine(self, fn, *, blocking: bool = True):
+        if blocking:
+            with self._engine_lock:
+                return fn()
+        if self._engine_lock.acquire(blocking=False):
+            try:
+                return fn()
+            finally:
+                self._engine_lock.release()
+        return None
+
+    def _eval_from_human_perspective_safe(self, fen: str | None = None, default: int = 0) -> int:
+        target = fen or self.latest_fen
+        white_cp = self._with_engine(lambda: self._engine.evaluate(target), blocking=False)
+        if white_cp is None:
+            return default
+        if self._human_color() == 'white':
+            return white_cp
+        return -white_cp
 
     def _append_move_history(
         self,
@@ -299,6 +1287,7 @@ class WebBridgeNode(Node):
             fen=self.latest_fen,
             human_color=self._human_color(),
             difficulty=self._difficulty(),
+            board_orientation=self._board_orientation(),
             game_phase=self.game_phase,
             game_result=self.game_result,
             winner=self.winner,
@@ -358,6 +1347,14 @@ class WebBridgeNode(Node):
         self.human_graveyard_slots = list(record.human_graveyard_slots)
         self.is_check = chess.Board(record.fen).is_check()
         self.promotion_notice = ''
+        orientation = getattr(record, 'board_orientation', 'standard') or 'standard'
+        if orientation in {'standard', 'flipped'}:
+            self.set_parameters([
+                Parameter('human_color', Parameter.Type.STRING, record.human_color),
+                Parameter('difficulty', Parameter.Type.STRING, record.difficulty),
+                Parameter('board_orientation', Parameter.Type.STRING, orientation),
+            ])
+            self._engine.configure_opponent(record.difficulty)  # type: ignore[arg-type]
 
     def _refresh_game_phase(self, fen: str) -> None:
         outcome = game_outcome(chess.Board(fen))
@@ -419,34 +1416,377 @@ class WebBridgeNode(Node):
         self.latest_message = '저장된 게임을 복원했습니다'
         self._spin_for_updates()
         self._persist_game_state()
+        self._bot_session_active = False
+        # Do not auto-play on restore; wait until reset_board starts a session.
 
-    def set_game_config(self, human_color: str, difficulty: str | None = None) -> None:
+    def set_game_config(
+        self,
+        human_color: str,
+        difficulty: str | None = None,
+        board_orientation: str | None = None,
+        *,
+        hand_auto_confirm_enabled: bool | None = None,
+    ) -> None:
         color = human_color.strip().lower()
         if color not in {'white', 'black'}:
             raise ValueError('human_color must be white or black')
-        with self._bot_lock:
-            if self._bot_busy:
-                raise RuntimeError('cannot change color while bot is moving')
+        # Lobby "게임 시작" always resets next — stop any in-flight bot/poll work first.
+        self._bot_session_active = False
+        self._prepare_robot_for_reset()
+        self._active_game_id = ''
+        with self._auto_move_lock:
+            self._pending_vision_auto_move = None
+            self._vision_auto_move_in_progress = False
+            self._last_auto_move_uci = ''
+            self._last_auto_move_at = 0.0
         params = [Parameter('human_color', Parameter.Type.STRING, color)]
         if difficulty is not None:
             level = difficulty.strip().lower()
-            if level not in {'easy', 'medium', 'hard'}:
-                raise ValueError('difficulty must be easy, medium, or hard')
+            if level not in {'beginner', 'easy', 'medium', 'hard', 'master'}:
+                raise ValueError(
+                    'difficulty must be beginner, easy, medium, hard, or master'
+                )
             params.append(Parameter('difficulty', Parameter.Type.STRING, level))
             self._engine.configure_opponent(level)  # type: ignore[arg-type]
+        if board_orientation is not None:
+            orientation = board_orientation.strip().lower()
+            if orientation not in {'standard', 'flipped'}:
+                raise ValueError('board_orientation must be standard or flipped')
+            params.append(Parameter('board_orientation', Parameter.Type.STRING, orientation))
+        if hand_auto_confirm_enabled is not None:
+            self.set_hand_auto_confirm_enabled(hand_auto_confirm_enabled)
         self.set_parameters(params)
         self.get_logger().info(
             f'Game config: human={color}, robot={self._robot_color()}, '
-            f'difficulty={self._difficulty()}'
+            f'difficulty={self._difficulty()}, orientation={self._board_orientation()}'
         )
 
     def _on_snapshot(self, msg: GameSnapshot) -> None:
+        game_id = (msg.game_id or '').strip()
+        if game_id.startswith('auto_move:'):
+            uci, fen_before_from_id = parse_auto_move_game_id(game_id)
+            fen_before_hint = fen_before_from_id
+            if not fen_before_hint and msg.fen:
+                if self._is_human_turn(self.latest_white_to_move):
+                    fen_before_hint = (self.latest_fen or '').strip()
+            if uci and msg.fen:
+                self._schedule_vision_auto_move(
+                    uci,
+                    msg.fen,
+                    fen_before_hint=fen_before_hint,
+                )
+            return
+
         if msg.fen:
             self.latest_fen = msg.fen
         self.latest_white_to_move = bool(msg.white_to_move)
         self.latest_move_number = int(msg.move_number)
 
+    def _uci_promo_variants(self, uci: str) -> list[str]:
+        uci = (uci or '').strip().lower()
+        if len(uci) > 4:
+            return [uci]
+        return [f'{uci[:4]}{promo}' for promo in ('', 'q', 'r', 'b', 'n')]
+
+    def _undo_move_on_after_board(self, after: chess.Board, uci: str) -> chess.Board | None:
+        try:
+            move = chess.Move.from_uci(uci)
+        except ValueError:
+            return None
+        piece = after.piece_at(move.to_square)
+        if piece is None:
+            return None
+        board = after.copy()
+        board.remove_piece_at(move.to_square)
+        rank = chess.square_rank(move.from_square)
+
+        if board.is_en_passant(move):
+            cap_sq = chess.square(
+                chess.square_file(move.to_square),
+                rank + (1 if piece.color == chess.WHITE else -1),
+            )
+            board.set_piece_at(move.from_square, chess.Piece(chess.PAWN, piece.color))
+            board.set_piece_at(cap_sq, chess.Piece(chess.PAWN, not piece.color))
+            board.turn = not after.turn
+            return board
+        elif board.is_castling(move):
+            board.set_piece_at(move.from_square, piece)
+            if move.to_square == chess.square(6, rank):
+                rook = board.remove_piece_at(chess.square(5, rank))
+                if rook is not None:
+                    board.set_piece_at(chess.square(7, rank), rook)
+            elif move.to_square == chess.square(2, rank):
+                rook = board.remove_piece_at(chess.square(3, rank))
+                if rook is not None:
+                    board.set_piece_at(chess.square(0, rank), rook)
+            board.turn = not after.turn
+            return board
+        else:
+            if move.promotion:
+                board.set_piece_at(move.from_square, chess.Piece(chess.PAWN, piece.color))
+            else:
+                board.set_piece_at(move.from_square, piece)
+            board.turn = not after.turn
+            resolved = resolve_legal_uci_full(uci, board.fen())
+            if resolved:
+                try:
+                    check = chess.Board(board.fen())
+                    check.push_uci(resolved)
+                    if check.board_fen() == after.board_fen() and check.turn == after.turn:
+                        return board
+                except ValueError:
+                    pass
+
+            board.remove_piece_at(move.from_square)
+            cap_color = not piece.color
+            for piece_type in (chess.PAWN, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT):
+                board.set_piece_at(move.from_square, piece)
+                board.set_piece_at(move.to_square, chess.Piece(piece_type, cap_color))
+                board.turn = not after.turn
+                resolved = resolve_legal_uci_full(uci, board.fen())
+                if not resolved:
+                    board.remove_piece_at(move.to_square)
+                    continue
+                try:
+                    check = chess.Board(board.fen())
+                    check.push_uci(resolved)
+                    if check.board_fen() == after.board_fen() and check.turn == after.turn:
+                        return board
+                except ValueError:
+                    pass
+                board.remove_piece_at(move.to_square)
+            return None
+
+    def _fen_before_player_move(
+        self,
+        fen_after: str,
+        uci: str,
+        *,
+        fen_before_hint: str | None = None,
+    ) -> str | None:
+        fen_after = (fen_after or '').strip()
+        hint = (fen_before_hint or '').strip()
+        if hint:
+            resolved = resolve_legal_uci_full(uci, hint)
+            if resolved:
+                try:
+                    trial = chess.Board(hint)
+                    trial.push_uci(resolved)
+                    after = chess.Board(fen_after)
+                    if trial.fen() == fen_after or (
+                        trial.board_fen() == after.board_fen() and trial.turn == after.turn
+                    ):
+                        return hint
+                except ValueError:
+                    pass
+
+        after = chess.Board(fen_after)
+        for cand_uci in self._uci_promo_variants(uci):
+            before = self._undo_move_on_after_board(after, cand_uci)
+            if before is None:
+                continue
+            fen_before = before.fen()
+            resolved = resolve_legal_uci_full(cand_uci, fen_before)
+            if resolved is None:
+                continue
+            try:
+                check = chess.Board(fen_before)
+                check.push_uci(resolved)
+            except ValueError:
+                continue
+            if check.board_fen() == after.board_fen() and check.turn == after.turn:
+                return fen_before
+        return None
+
+    def _vision_auto_move_ready(self) -> bool:
+        if self._board_reset_in_progress or not self._active_game_id:
+            return False
+        if self.game_phase != 'playing':
+            return False
+        if self._bot_busy or self._hand_confirm_in_progress:
+            return False
+        with self._hand_lock:
+            if self._hand_in_board or self._hand_raw_in_board:
+                return False
+        return True
+
+    def _schedule_vision_auto_move(
+        self,
+        uci: str,
+        fen_after: str,
+        *,
+        fen_before_hint: str = '',
+    ) -> None:
+        uci = (uci or '').strip()
+        fen_after = (fen_after or '').strip()
+        if not uci or not fen_after:
+            return
+        with self._auto_move_lock:
+            self._pending_vision_auto_move = (uci, fen_after, (fen_before_hint or '').strip())
+        self._try_process_pending_vision_auto_move()
+
+    def _try_process_pending_vision_auto_move(self) -> None:
+        with self._auto_move_lock:
+            pending = self._pending_vision_auto_move
+            if pending is None or self._vision_auto_move_in_progress:
+                return
+            uci, fen_after, fen_before_hint = pending
+        if not self._vision_auto_move_ready():
+            return
+        cooldown = float(self.get_parameter('hand_confirm_cooldown_sec').value)
+        with self._auto_move_lock:
+            if (
+                uci == self._last_auto_move_uci
+                and time.time() - self._last_auto_move_at < cooldown
+            ):
+                if self._is_robot_turn(self.latest_white_to_move) and not self._bot_busy:
+                    self._maybe_resume_bot_after_player_move()
+                else:
+                    self._pending_vision_auto_move = None
+                return
+            self._vision_auto_move_in_progress = True
+
+        def _run() -> None:
+            success = False
+            try:
+                success = self._handle_vision_auto_move(
+                    uci,
+                    fen_after,
+                    fen_before_hint=fen_before_hint,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'vision auto move failed: {exc}')
+            finally:
+                with self._auto_move_lock:
+                    self._vision_auto_move_in_progress = False
+                    if success:
+                        self._last_auto_move_uci = uci
+                        self._last_auto_move_at = time.time()
+                        self._pending_vision_auto_move = None
+                if success:
+                    self._maybe_resume_bot_after_player_move()
+
+        threading.Thread(target=_run, daemon=True, name='vision_auto_move').start()
+
+    def _maybe_resume_bot_after_player_move(self) -> None:
+        """Retry bot reply when vision detected a move but the arm never started."""
+        if not self._bot_session_active:
+            return
+        if self._board_reset_in_progress:
+            return
+        if not self._active_game_id:
+            return
+        if self.game_phase != 'playing' or not self._auto_bot_move():
+            return
+        self._recover_stale_bot_activity()
+        if self._bot_busy or self.bot_status in ('thinking', 'moving', 'paused'):
+            return
+        if self._hand_safety_paused:
+            return
+        if not self._is_robot_turn(self.latest_white_to_move):
+            return
+        with self._auto_move_lock:
+            if self._pending_vision_auto_move is not None:
+                return
+        cooldown = float(self.get_parameter('hand_confirm_cooldown_sec').value)
+        if time.time() - self._last_bot_resume_attempt_at < cooldown:
+            return
+        self._last_bot_resume_attempt_at = time.time()
+        self.get_logger().info(
+            f'resuming bot move after player turn (fen={self.latest_fen[:32]}...)'
+        )
+        self._maybe_play_bot_move(self.latest_fen)
+
+    def _handle_vision_auto_move(
+        self,
+        uci: str,
+        fen_after: str,
+        *,
+        fen_before_hint: str = '',
+    ) -> bool:
+        fen_after = (fen_after or '').strip()
+        if not fen_after:
+            return False
+        fen_before = self._fen_before_player_move(
+            fen_after,
+            uci,
+            fen_before_hint=fen_before_hint,
+        )
+        if not fen_before:
+            self.get_logger().warn(f'vision auto move: cannot infer fen_before for {uci}')
+            try:
+                after_board = chess.Board(fen_after)
+            except ValueError:
+                return False
+            if self._is_robot_turn(after_board.turn == chess.WHITE):
+                self._sync_from_fen(fen_after)
+                from_sq, to_sq = uci[:2], uci[2:4] if len(uci) >= 4 else ('', '')
+                if from_sq and to_sq:
+                    self.latest_from = from_sq
+                    self.latest_to = to_sq
+                self.latest_message = f'수 인지됨 (fallback): {from_sq} → {to_sq}'
+                self._spin_for_updates(3)
+                self._update_game_over_state(fen_after)
+                self.is_check = after_board.is_check()
+                if self.game_phase != 'finished':
+                    self._recover_stale_bot_activity()
+                    self._maybe_play_bot_move(fen_after)
+                self._persist_game_state()
+                return True
+            return False
+        legal = resolve_legal_uci_full(uci, fen_before)
+        if legal is None:
+            self.get_logger().warn(f'vision auto move: illegal uci {uci} on {fen_before}')
+            return False
+        if not self._uci_is_human_move(fen_before, legal):
+            self.get_logger().warn(f'vision auto move: not human piece {uci}')
+            return False
+
+        from_sq, to_sq = legal[:2], legal[2:4]
+        self.get_logger().info(f'vision auto move: {from_sq}->{to_sq} ({legal})')
+        self.latest_from = from_sq
+        self.latest_to = to_sq
+        self._sync_from_fen(fen_after)
+
+        self._ensure_active_game()
+        board = chess.Board(fen_before)
+        move = chess.Move.from_uci(legal)
+        captured = captured_piece_symbol(board, move) or ''
+
+        try:
+            self._push_undo_snapshot(fen_before, legal, by_robot=False)
+            self._record_capture(
+                fen_before,
+                legal,
+                by_robot=False,
+                captured_symbol=captured or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'vision auto move capture record failed: {exc}')
+
+        try:
+            self._process_player_move_feedback(fen_before, legal)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'vision auto move feedback failed: {exc}')
+
+        promo = promotion_piece_char(move)
+        if promo:
+            self.promotion_notice = promotion_notice(from_sq, to_sq, promo)
+
+        self.latest_message = f'수 인지됨: {from_sq} → {to_sq}'
+        self._spin_for_updates(3)
+        self._update_game_over_state(fen_after)
+        self.is_check = chess.Board(fen_after).is_check()
+        if self.game_phase != 'finished':
+            self._recover_stale_bot_activity()
+            self._maybe_play_bot_move(fen_after)
+        self._persist_game_state()
+        return True
+
     def _maybe_play_bot_move(self, fen: str) -> None:
+        if not self._bot_session_active:
+            return
+        self._recover_stale_bot_activity()
         if self.game_phase == 'finished':
             self.get_logger().info('bot move skipped: game finished')
             return
@@ -461,6 +1801,9 @@ class WebBridgeNode(Node):
             self.get_logger().info(
                 f'bot move skipped: not robot turn (white_to_move={white_to_move})'
             )
+            return
+        if self.bot_status in ('thinking', 'moving', 'paused') or self._hand_safety_paused:
+            self.get_logger().info('bot move skipped: bot active or safety paused')
             return
         with self._bot_lock:
             if self._bot_busy:
@@ -479,17 +1822,41 @@ class WebBridgeNode(Node):
                 with self._bot_lock:
                     self._bot_busy = False
                     self._bot_pending_fen = ''
+                if self._bot_worker_thread is threading.current_thread():
+                    self._bot_worker_thread = None
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._bot_cancel_requested = False
+        thread = threading.Thread(target=worker, daemon=True, name='bot_move_worker')
+        self._bot_worker_thread = thread
+        thread.start()
+
+    def _robot_action_ready(self) -> bool:
+        return self.action_client.wait_for_server(timeout_sec=0.5)
 
     def _run_bot_move(self, fen: str) -> None:
+        if self._bot_cancel_requested:
+            return
         try:
+            self._bot_activity_started_at = time.time()
             self.bot_status = 'thinking'
             self.latest_message = '로봇이 수를 계산 중...'
-            time.sleep(0.5)
+            time.sleep(0.1)
+            if self._bot_cancel_requested:
+                self.bot_status = 'idle'
+                return
+            if not self._robot_action_ready():
+                self.bot_status = 'error'
+                self.latest_message = (
+                    '로봇 노드 없음 — launch 재시작 필요 (pick_place_node 확인)'
+                )
+                self.get_logger().error('robot/execute_move action server unavailable')
+                return
 
             self._engine.configure_opponent(self._difficulty())
             uci = self._with_engine(lambda: self._engine.choose_move(fen))
+            if uci is None or self._bot_cancel_requested:
+                self.bot_status = 'idle'
+                return
             from_sq, to_sq = uci[:2], uci[2:4]
             self.get_logger().info(f'Bot move planned: {uci} (fen={fen})')
 
@@ -507,6 +1874,11 @@ class WebBridgeNode(Node):
             self.bot_status = 'error'
             self.latest_message = f'로봇 수 오류: {exc}'
             self.get_logger().error(f'Bot move error: {exc}')
+        finally:
+            self._bot_activity_started_at = 0.0
+            with self._bot_lock:
+                self._bot_busy = False
+                self._bot_pending_fen = ''
 
     def _apply_board_state_msg(self, board_state: BoardState) -> None:
         if board_state.occupancy.cells:
@@ -684,6 +2056,7 @@ class WebBridgeNode(Node):
             'white_to_move': self.latest_white_to_move,
             'human_color': self._human_color(),
             'robot_color': self._robot_color(),
+            'board_orientation': self._board_orientation(),
             'bot_status': self.bot_status,
             'last_bot_move': self.last_bot_move,
             'auto_bot_move': self._auto_bot_move(),
@@ -709,29 +2082,143 @@ class WebBridgeNode(Node):
         if self.latest_from and self.latest_to:
             payload['from'] = self.latest_from
             payload['to'] = self.latest_to
+        if self._latest_twin_report is not None:
+            payload['twin_report'] = self._latest_twin_report
+        payload['twin_available'] = self._twin_enabled()
+        payload['twin_runtime_enabled'] = self.is_twin_runtime_enabled()
+        payload['hand_available'] = self._hand_enabled()
+        payload['hand_auto_confirm_enabled'] = self._hand_auto_confirm_runtime
         return payload
 
+    def attach_executor(self, executor: MultiThreadedExecutor) -> None:
+        self._executor = executor
+
+    def _wait_future(self, future, timeout_sec: float) -> bool:
+        """Wait for an rclpy future; executor pump timer processes the response."""
+        deadline = time.time() + timeout_sec
+        while not future.done() and time.time() < deadline:
+            time.sleep(0.01)
+        return future.done()
+
+    def _wait_for_service(self, client, timeout_sec: float = 15.0) -> bool:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if client.service_is_ready():
+                return True
+            time.sleep(0.05)
+        return client.service_is_ready()
+
     def _call_service(self, client, request, timeout_sec: float = 60.0):
-        if not client.wait_for_service(timeout_sec=5.0):
-            return None, 'service unavailable'
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
-        if not future.done():
-            return None, f'service call timed out after {timeout_sec}s'
-        if future.result() is None:
-            return None, 'service call failed'
-        return future.result(), ''
+        with self._service_call_lock:
+            if not self._wait_for_service(client, timeout_sec=15.0):
+                return None, 'service unavailable'
+            future = client.call_async(request)
+            if not self._wait_future(future, timeout_sec):
+                return None, f'service call timed out after {timeout_sec}s'
+            if future.result() is None:
+                return None, 'service call failed'
+            return future.result(), ''
+
+    def _call_service_cli(
+        self,
+        service: str,
+        srv_type: str,
+        *,
+        timeout_sec: float = 60.0,
+        yaml_payload: str = '{}',
+    ) -> tuple[bool, str]:
+        """Fallback ROS service call via ros2 CLI (avoids HTTP-thread executor deadlocks)."""
+        env_script = Path.home() / 'Rokey-A-1-cobot2' / 'chess_project_env.sh'
+        cmd = (
+            f'source "{env_script}" && '
+            f'timeout {max(5, int(timeout_sec))} '
+            f'ros2 service call {service} {srv_type} "{yaml_payload}"'
+        )
+        try:
+            proc = subprocess.run(
+                ['bash', '-lc', cmd],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec + 5.0,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f'service cli timed out after {timeout_sec}s'
+        output = '\n'.join(part for part in (proc.stdout, proc.stderr) if part).strip()
+        if proc.returncode != 0:
+            return False, output or f'service cli exit {proc.returncode}'
+        if 'success=True' in output.replace(' ', ''):
+            return True, output
+        if 'success=False' in output.replace(' ', ''):
+            return False, output
+        return True, output
 
     def _spin_for_updates(self, count: int = 10) -> None:
-        for _ in range(count):
-            rclpy.spin_once(self, timeout_sec=0.05)
+        time.sleep(max(0.05, count * 0.05))
 
-    def reset_board(self) -> tuple[bool, str]:
+    def _reset_hand_tracking(self) -> None:
+        if self._hand_service is not None:
+            self._hand_service.tracker.reset()
+        with self._hand_lock:
+            self._hand_in_board = False
+            self._hand_raw_in_board = False
+            self._hand_seen = False
+            self._hand_present = False
+            self._hand_raw_in_board_prev = False
+            self._hand_safety_paused = False
+            self._hand_left_at = 0.0
+            self._hand_confirm_pending = False
+            self._hand_confirm_in_progress = False
+        with self._auto_move_lock:
+            self._last_auto_move_uci = ''
+            self._last_auto_move_at = 0.0
+            self._pending_vision_auto_move = None
+            self._vision_auto_move_in_progress = False
+        self._publish_hand_in_board(False)
+
+    def _cancel_active_robot_goals(self) -> None:
+        for handle in (self._active_move_goal_handle, self._active_restore_goal_handle):
+            if handle is None:
+                continue
+            try:
+                cancel_future = handle.cancel_goal_async()
+                self._wait_future(cancel_future, 3.0)
+            except Exception:  # noqa: BLE001
+                pass
+        self._active_move_goal_handle = None
+        self._active_restore_goal_handle = None
+
+    def _prepare_robot_for_reset(self) -> None:
+        """Clear hand pause / in-flight arm goals so reset_board can finish quickly."""
+        self._bot_cancel_requested = True
+        self._recover_stale_bot_activity()
         with self._bot_lock:
             self._bot_pending_fen = ''
             self._bot_busy = False
-        self.last_bot_move = ''
+        worker = self._bot_worker_thread
+        if worker is not None and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=3.0)
+        self._bot_worker_thread = None
+        self._bot_cancel_requested = False
         self.bot_status = 'idle'
+        self._hand_safety_paused = False
+        self._publish_hand_in_board(False, force=True)
+        self._cancel_active_robot_goals()
+        time.sleep(0.2)
+        self._publish_hand_in_board(False, force=True)
+
+    def reset_board(self) -> tuple[bool, str]:
+        self.get_logger().info('reset_board: start')
+        self._board_reset_in_progress = True
+        try:
+            return self._reset_board_impl()
+        finally:
+            self._board_reset_in_progress = False
+
+    def _reset_board_impl(self) -> tuple[bool, str]:
+        self._reset_hand_tracking()
+        self._prepare_robot_for_reset()
+        self.get_logger().info('reset_board: robot prepared')
         self.human_captures = []
         self.robot_captures = []
         self.move_history = []
@@ -741,17 +2228,23 @@ class WebBridgeNode(Node):
         self._undo_snapshots = []
         self._pending_promotion = None
         self._pending_illegal_move = None
-        self.eval_cp = self._eval_from_human_perspective(START_FEN)
+        self.eval_cp = 0
         self._set_bot_banter(greeting(self._difficulty()))
         self.game_phase = 'playing'
         self.game_result = ''
         self.winner = ''
         self.is_check = False
         self.promotion_notice = ''
+        self.last_bot_move = ''
 
-        success, message = self._reset_robot()
-        if not success:
-            return False, message
+        robot_ok, robot_msg = self._reset_robot()
+        self.get_logger().info(f'reset_board: robot reset success={robot_ok}')
+        if not robot_ok and not self._vision_mode():
+            return False, robot_msg
+        if not robot_ok:
+            self.get_logger().warn(
+                f'reset_board: robot reset failed — continuing with vision scan: {robot_msg}'
+            )
         if not self._vision_mode():
             self._sync_from_fen(START_FEN)
             record = self._game_store.create_new_game(
@@ -763,24 +2256,20 @@ class WebBridgeNode(Node):
             )
             self._active_game_id = record.id
             self._persist_game_state()
+            self._bot_session_active = True
             self._maybe_play_bot_move(self.latest_fen)
             return True, message
 
-        result, err = self._call_service(self.scan_initial_client, ScanInitial.Request(), timeout_sec=90.0)
-        if result is None:
-            return False, err
+        scan_ok, scan_msg = self._run_scan_initial()
+        self.get_logger().info(f'reset_board: scan success={scan_ok}')
+        if not scan_ok:
+            return False, scan_msg
         self.latest_from = ''
         self.latest_to = ''
-        if result.board_state is not None:
-            self._apply_board_state_msg(result.board_state)
-        if getattr(result, 'fen', ''):
-            self._sync_from_fen(result.fen)
-        self.eval_cp = self._eval_from_human_perspective()
+        self.eval_cp = self._eval_from_human_perspective_safe()
         self._spin_for_updates()
-        if self.latest_fen:
-            sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
-            if not sync_ok:
-                self.get_logger().warn(f'robot board sync after initial scan failed: {sync_msg}')
+        # pick_place is already reset via chess/reset_board; skip set_board here to
+        # avoid blocking game start when the robot service queue is busy.
         record = self._game_store.create_new_game(
             fen=self.latest_fen,
             human_color=self._human_color(),
@@ -792,8 +2281,13 @@ class WebBridgeNode(Node):
         self.graveyard_slots = list(record.graveyard_slots)
         self.human_graveyard_slots = list(record.human_graveyard_slots)
         self._persist_game_state()
+        self._bot_session_active = True
         self._maybe_play_bot_move(self.latest_fen)
-        return bool(result.success), result.message
+        sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+        if not sync_ok:
+            self.get_logger().warn(f'reset_board: robot sync failed (non-fatal): {sync_msg}')
+        self.get_logger().info('reset_board: complete')
+        return scan_ok, scan_msg
 
     def restore_board_physical(self) -> tuple[bool, str]:
         if not self.restore_action_client.wait_for_server(timeout_sec=5.0):
@@ -805,27 +2299,32 @@ class WebBridgeNode(Node):
                 return False, sync_msg
 
         send_future = self.restore_action_client.send_goal_async(RestoreBoard.Goal())
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
-        if not send_future.done() or send_future.result() is None:
+        if not self._wait_future(send_future, 10.0) or send_future.result() is None:
             return False, 'failed to send restore goal'
 
         goal_handle = send_future.result()
         if not goal_handle.accepted:
             return False, 'restore goal rejected'
 
+        self._restore_in_progress = True
+        self._active_restore_goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
         deadline = time.time() + 600.0
-        while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            if result_future.done():
-                break
-        if not result_future.done():
-            goal_handle.cancel_goal_async()
-            return False, 'restore timed out'
+        try:
+            while time.time() < deadline:
+                if result_future.done():
+                    break
+                time.sleep(0.05)
+            if not result_future.done():
+                goal_handle.cancel_goal_async()
+                return False, 'restore timed out'
 
-        result = result_future.result().result
-        if not result.success:
-            return False, result.message
+            result = result_future.result().result
+            if not result.success:
+                return False, result.message
+        finally:
+            self._restore_in_progress = False
+            self._active_restore_goal_handle = None
 
         if self._vision_mode():
             scan_result, err = self._call_service(
@@ -865,31 +2364,101 @@ class WebBridgeNode(Node):
         self._persist_game_state()
         return True, '기권했습니다'
 
+    @staticmethod
+    def _ros_yaml_quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
     def _reset_robot(self) -> tuple[bool, str]:
-        if not self.reset_client.wait_for_service(timeout_sec=2.0):
-            return False, 'reset service unavailable'
-        future = self.reset_client.call_async(ResetBoard.Request())
-        rclpy.spin_until_future_complete(self, future, timeout_sec=30.0)
-        if not future.done() or future.result() is None:
-            return False, 'reset call failed'
-        result = future.result()
-        return bool(result.success), result.message
+        ok, msg = self._call_service_cli(
+            '/chess/reset_board',
+            'chess_msgs/srv/ResetBoard',
+            timeout_sec=12.0,
+        )
+        if ok:
+            return True, 'board reset'
+        self.get_logger().warn(f'reset_board cli failed ({msg}); trying rclpy')
+        result, err = self._call_service(
+            self.reset_client,
+            ResetBoard.Request(),
+            timeout_sec=6.0,
+        )
+        if result is not None:
+            return bool(result.success), result.message
+        hint = (
+            '손을 카메라에서 치우고 다시 시도하세요. '
+            'pick_place_node가 실행 중인지도 확인하세요 '
+            '(scripts/stop_chess_stack.sh 후 launch 재시작)'
+        )
+        if err == 'service unavailable' and not ok:
+            return False, f'reset service unavailable — {hint}'
+        return False, msg or err or f'reset call failed — {hint}'
+
+    def _run_scan_initial(self) -> tuple[bool, str]:
+        ok, cli_out = self._call_service_cli(
+            '/chess/scan_initial',
+            'chess_msgs/srv/ScanInitial',
+            timeout_sec=45.0,
+        )
+        if ok:
+            fen_match = re.search(r"fen='([^']+)'", cli_out)
+            msg_match = re.search(r"message='([^']*)'", cli_out)
+            if fen_match:
+                self._sync_from_fen(fen_match.group(1))
+            message = msg_match.group(1) if msg_match else cli_out
+            return True, message
+        self.get_logger().warn(f'scan_initial cli failed ({cli_out}); trying rclpy')
+        result, err = self._call_service(
+            self.scan_initial_client,
+            ScanInitial.Request(),
+            timeout_sec=20.0,
+        )
+        if result is not None:
+            if result.board_state is not None:
+                self._apply_board_state_msg(result.board_state)
+            if getattr(result, 'fen', ''):
+                self._sync_from_fen(result.fen)
+            return bool(result.success), result.message
+        return False, cli_out or err or 'scan_initial failed'
 
     def _sync_robot_board(self, fen: str) -> tuple[bool, str]:
         """Sync pick_place_node internal FEN/occupancy with the logical game state."""
         fen = (fen or '').strip()
         if not fen:
             return False, 'empty FEN for robot sync'
+        gy_json = json.dumps(self.graveyard_slots)
+        human_gy_json = json.dumps(self.human_graveyard_slots)
+        human_color = self._human_color()
+        board_orientation = self._board_orientation()
+        yaml_payload = (
+            '{'
+            f'fen: {self._ros_yaml_quote(fen)}, '
+            f'graveyard_slots_json: {self._ros_yaml_quote(gy_json)}, '
+            f'human_graveyard_slots_json: {self._ros_yaml_quote(human_gy_json)}, '
+            f'human_color: {self._ros_yaml_quote(human_color)}, '
+            f'board_orientation: {self._ros_yaml_quote(board_orientation)}'
+            '}'
+        )
+        ok, cli_out = self._call_service_cli(
+            '/robot/set_board',
+            'chess_msgs/srv/SetBoard',
+            timeout_sec=8.0,
+            yaml_payload=yaml_payload,
+        )
+        if ok:
+            return True, cli_out or 'robot board synced'
+        self.get_logger().warn(f'robot/set_board cli failed ({cli_out}); trying rclpy')
         request = SetBoard.Request(fen=fen)
-        request.graveyard_slots_json = json.dumps(self.graveyard_slots)
-        request.human_graveyard_slots_json = json.dumps(self.human_graveyard_slots)
+        request.graveyard_slots_json = gy_json
+        request.human_graveyard_slots_json = human_gy_json
+        request.human_color = human_color
+        request.board_orientation = board_orientation
         result, err = self._call_service(
             self.robot_set_board_client,
             request,
-            timeout_sec=10.0,
+            timeout_sec=15.0,
         )
         if result is None:
-            return False, f'robot board sync failed: {err}'
+            return False, f'robot board sync failed: {cli_out or err}'
         if not result.success:
             return False, f'robot board sync failed: {result.message}'
         return True, result.message
@@ -909,6 +2478,9 @@ class WebBridgeNode(Node):
             with self._bot_lock:
                 self._bot_pending_fen = ''
                 self._bot_busy = False
+
+        if not self._is_human_turn(self.latest_white_to_move):
+            return False, '지금은 로봇 차례입니다', '', ''
 
         fen_before = self.latest_fen
         request = ConfirmPlayerMove.Request()
@@ -945,7 +2517,8 @@ class WebBridgeNode(Node):
             else ''
         )
         legal = bool(uci) and self._is_legal_uci(fen_before, uci)
-        success = bool(result.success) and legal
+        human_move = bool(uci) and self._uci_is_human_move(fen_before, uci)
+        success = bool(result.success) and legal and human_move
         bot_fen = ''
 
         if self._is_illegal_move_result(result, legal=legal, uci=uci):
@@ -998,6 +2571,11 @@ class WebBridgeNode(Node):
                     result.to_square,
                     promo,
                 )
+        elif result.success and legal and not human_move:
+            self.latest_message = f'사용자 기물이 아닌 수입니다: {uci or "unknown"}'
+            self.get_logger().warn(
+                f'vision move wrong piece color: {uci} (fen={fen_before})'
+            )
         elif result.success and not legal:
             self.latest_message = f'불법 수입니다: {uci or "unknown"}'
             self.get_logger().warn(
@@ -1013,7 +2591,7 @@ class WebBridgeNode(Node):
         elif not success and result.board_state is not None:
             self._apply_board_state_msg(result.board_state)
 
-        self._spin_for_updates()
+        self._spin_for_updates(3)
         if success and bot_fen:
             sync_ok, sync_msg = self._sync_robot_board(bot_fen)
             if not sync_ok:
@@ -1023,31 +2601,60 @@ class WebBridgeNode(Node):
             self._update_game_over_state(bot_fen)
             self.is_check = chess.Board(bot_fen).is_check()
             if self.game_phase != 'finished':
+                self._recover_stale_bot_activity()
                 self._maybe_play_bot_move(bot_fen)
             else:
                 self.get_logger().info('bot move skipped after player move: game finished')
 
         if not success and 'no move detected' in (result.message or '').lower():
+            msg = result.message or ''
+            board_unchanged = 'departed=-' in msg and 'arrived=-' in msg
+            result_fen = (getattr(result, 'fen', '') or '').strip()
+            robot_turn = self._is_robot_turn(self.latest_white_to_move)
+            if not robot_turn and result_fen:
+                try:
+                    robot_turn = self._is_robot_turn(
+                        chess.Board(result_fen).turn == chess.WHITE
+                    )
+                except ValueError:
+                    robot_turn = False
             if (
                 self.game_phase != 'finished'
-                and self._is_robot_turn(self.latest_white_to_move)
+                and robot_turn
+                and (board_unchanged or result_fen)
             ):
+                if result_fen:
+                    self._sync_from_fen(result_fen)
                 self.get_logger().info(
                     'confirm: board already reflects last move; triggering bot'
                 )
-                self._maybe_play_bot_move(self.latest_fen)
+                self._recover_stale_bot_activity()
+                self._maybe_play_bot_move(result_fen or self.latest_fen)
                 self._persist_game_state()
+                from_sq = getattr(result, 'from_square', '') or ''
+                to_sq = getattr(result, 'to_square', '') or ''
                 return (
                     True,
                     '이미 반영된 수입니다. 로봇이 응수합니다.',
-                    result.from_square,
-                    result.to_square,
+                    from_sq,
+                    to_sq,
                 )
 
         if success or result.success:
             self._persist_game_state()
 
         message = self.latest_message if not success and not legal else result.message
+        if (
+            not success
+            and self._twin_active()
+            and bool(self.get_parameter('twin_auto_on_confirm_fail').value)
+        ):
+            try:
+                twin_payload = self.verify_board_twin(confirm_failed=True, use_fresh_scan=True)
+                if not twin_payload.get('aligned', True):
+                    message = f'{message} (Reality Check: {twin_payload.get("message", "")})'
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warn(f'board twin auto verify failed: {exc}')
         return (
             success,
             message,
@@ -1403,28 +3010,31 @@ class WebBridgeNode(Node):
         self._fill_chess_move(goal.move, fen, uci)
 
         send_future = self.action_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=10.0)
-        if not send_future.done() or send_future.result() is None:
+        if not self._wait_future(send_future, 10.0) or send_future.result() is None:
             return False, 'failed to send goal'
 
         goal_handle = send_future.result()
         if not goal_handle.accepted:
             return False, 'goal rejected'
 
+        self._active_move_goal_handle = goal_handle
         result_future = goal_handle.get_result_async()
         deadline = time.time() + 180.0
-        while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
-            if result_future.done():
-                break
-        if not result_future.done():
-            goal_handle.cancel_goal_async()
-            return False, 'move timed out'
+        try:
+            while time.time() < deadline:
+                if result_future.done():
+                    break
+                time.sleep(0.05)
+            if not result_future.done():
+                goal_handle.cancel_goal_async()
+                return False, 'move timed out'
 
-        result = result_future.result().result
-        if not result.success:
-            return False, result.message
-        return True, result.message
+            result = result_future.result().result
+            if not result.success:
+                return False, result.message
+            return True, result.message
+        finally:
+            self._active_move_goal_handle = None
 
     def _push_local_fen_move(self, uci: str, *, fen: str) -> bool:
         """Apply a move to local FEN only (fallback when vision_game sync fails)."""
@@ -1523,7 +3133,7 @@ class WebBridgeNode(Node):
         self.latest_to = legal[2:4]
         return True, physical_msg
 
-    def execute_voice_player_move(self, transcript: str) -> dict[str, Any]:
+    def execute_voice_command(self, transcript: str) -> dict[str, Any]:
         transcript = (transcript or '').strip()
         base: dict[str, Any] = {
             'success': False,
@@ -1533,6 +3143,7 @@ class WebBridgeNode(Node):
             'transcript': transcript,
             'parse_error': False,
             'promotion_required': False,
+            'voice_action': 'parse_error',
         }
 
         if self.game_phase == 'finished':
@@ -1542,11 +3153,6 @@ class WebBridgeNode(Node):
         if self.bot_status in ('thinking', 'moving'):
             raise RuntimeError('봇이 동작 중입니다. 잠시 후 다시 시도하세요.')
 
-        if self._is_robot_turn(self.latest_white_to_move):
-            base['message'] = '지금은 당신 차례가 아닙니다'
-            self.latest_message = base['message']
-            return base
-
         if not transcript:
             self._set_bot_banter(react_to_voice_empty(self._difficulty()))
             base['message'] = self.bot_message
@@ -1554,9 +3160,100 @@ class WebBridgeNode(Node):
             self._persist_game_state()
             return base
 
-        parsed = parse_voice_move(transcript)
+        game_action = parse_game_voice_command(transcript)
+        if game_action is not None:
+            return self._execute_voice_game_action(game_action, transcript, base)
+
+        return self._execute_voice_move_action(transcript, base)
+
+    def execute_voice_player_move(self, transcript: str) -> dict[str, Any]:
+        return self.execute_voice_command(transcript)
+
+    def _execute_voice_game_action(
+        self,
+        action: str,
+        transcript: str,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.get_logger().info(
+            f'voice game command action={action} transcript={transcript!r}'
+        )
+        base['voice_action'] = action
+        success = False
+        message = ''
+        from_sq = ''
+        to_sq = ''
+
+        if action == 'confirm':
+            if self._is_robot_turn(self.latest_white_to_move):
+                message = '지금은 당신 차례가 아닙니다'
+                self._set_bot_banter(react_to_voice_confirm_fail(self._difficulty(), message=message))
+            else:
+                success, message, from_sq, to_sq = self.confirm_player_move()
+                if success:
+                    self._set_bot_banter(react_to_voice_confirm_success(self._difficulty()))
+                else:
+                    self._set_bot_banter(react_to_voice_confirm_fail(self._difficulty(), message=message))
+        elif action == 'undo':
+            try:
+                success, message = self.undo_last_turn()
+            except RuntimeError:
+                raise
+            if success:
+                self._set_bot_banter(react_to_voice_undo_success(self._difficulty()))
+            else:
+                self._set_bot_banter(react_to_voice_undo_fail(self._difficulty(), message=message))
+        elif action == 'restore':
+            success, message = self.restore_board_physical()
+            if success:
+                self._set_bot_banter(react_to_voice_restore_success(self._difficulty()))
+            else:
+                self._set_bot_banter(react_to_voice_restore_fail(self._difficulty(), message=message))
+        elif action == 'resign':
+            success, message = self.resign_game()
+            if success:
+                self._set_bot_banter(react_to_voice_resign_success(self._difficulty()))
+            else:
+                self._set_bot_banter(react_to_voice_resign_fail(self._difficulty(), message=message))
+
+        base['success'] = success
+        base['message'] = self.bot_message or message
+        base['from'] = from_sq
+        base['to'] = to_sq
+        self.latest_message = base['message']
+        if self._pending_illegal_move:
+            base['illegal_move'] = True
+        self._spin_for_updates()
+        self._persist_game_state()
+        return base
+
+    def _execute_voice_move_action(
+        self,
+        transcript: str,
+        base: dict[str, Any],
+    ) -> dict[str, Any]:
+        base['voice_action'] = 'move'
+
+        if self._is_robot_turn(self.latest_white_to_move):
+            base['message'] = '지금은 당신 차례가 아닙니다'
+            self.latest_message = base['message']
+            return base
+
+        fen_before = self.latest_fen
+        parsed, parse_method = parse_voice_command_with_meta(
+            transcript,
+            fen=fen_before,
+            human_color=self._human_color(),
+            llm_enabled=self._voice_llm_enabled(),
+            llm_auto=self._voice_llm_auto(),
+            llm_model=self._voice_llm_model(),
+            llm_base_url=self._voice_llm_base_url(),
+        )
         if isinstance(parsed, VoiceMoveParseError):
-            self._set_bot_banter(react_to_voice_parse_error(self._difficulty()))
+            if parsed.kind == 'ambiguous':
+                self._set_bot_banter(react_to_voice_ambiguous(self._difficulty()))
+            else:
+                self._set_bot_banter(react_to_voice_parse_error(self._difficulty()))
             base['parse_error'] = True
             base['message'] = self.bot_message
             self.latest_message = base['message']
@@ -1569,7 +3266,19 @@ class WebBridgeNode(Node):
         base['from'] = from_sq
         base['to'] = to_sq
 
-        fen_before = self.latest_fen
+        intent_ok, intent_msg = validate_voice_move_intent(
+            transcript,
+            fen_before,
+            self._human_color(),
+            move,
+        )
+        if not intent_ok:
+            self._set_bot_banter(react_to_voice_illegal(self._difficulty(), from_sq=from_sq, to_sq=to_sq))
+            base['message'] = self.bot_message or intent_msg
+            self.latest_message = base['message']
+            self._persist_game_state()
+            return base
+
         legal, promo_required, resolve_msg = resolve_voice_move(fen_before, move)
 
         if promo_required:
@@ -1595,6 +3304,11 @@ class WebBridgeNode(Node):
             self.latest_message = base['message']
             self._persist_game_state()
             return base
+
+        self.get_logger().info(
+            f'voice move transcript={transcript!r} parse_method={parse_method} uci={legal}'
+        )
+        base['parsed_summary'] = f'{from_sq}{"x" if chess.Board(fen_before).is_capture(chess.Move.from_uci(legal)) else ""}{to_sq}'
 
         self._pending_promotion = None
         self._pending_illegal_move = None
@@ -1685,7 +3399,12 @@ def create_app(node: WebBridgeNode) -> FastAPI:
     @app.post('/api/game/config')
     def set_game_config(req: GameConfigRequest) -> dict[str, Any]:
         try:
-            node.set_game_config(req.human_color, req.difficulty)
+            node.set_game_config(
+                req.human_color,
+                req.difficulty,
+                req.board_orientation,
+                hand_auto_confirm_enabled=req.hand_auto_confirm_enabled,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -1737,10 +3456,69 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             payload['illegal_move'] = True
         return payload
 
+    @app.post('/api/twin/verify')
+    def twin_verify(req: TwinVerifyRequest) -> dict[str, Any]:
+        try:
+            payload = node.verify_board_twin(
+                confirm_failed=req.confirm_failed,
+                use_fresh_scan=req.use_fresh_scan,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {**payload, **node.get_board_payload()}
+
+    @app.get('/api/twin/calibration')
+    def twin_calibration_get() -> dict[str, Any]:
+        if not node._twin_enabled():
+            raise HTTPException(status_code=400, detail='sideview twin is not available in this launch')
+        return node.get_side_calibration_payload()
+
+    @app.post('/api/twin/calibration')
+    def twin_calibration_save(req: TwinCalibrationRequest) -> dict[str, Any]:
+        if not node._twin_enabled():
+            raise HTTPException(status_code=400, detail='sideview twin is not available in this launch')
+        success, message = node.save_side_calibration(
+            req.board_corners,
+            flip_files=req.flip_files,
+            board_flipped=req.board_flipped,
+        )
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
+        return {
+            'success': True,
+            'message': message,
+            **node.get_side_calibration_payload(),
+            **node.get_twin_live_payload(),
+        }
+
+    @app.post('/api/hand/config')
+    def hand_config(req: HandConfigRequest) -> dict[str, Any]:
+        if not node._hand_enabled():
+            raise HTTPException(status_code=400, detail='hand detection is not available in this launch')
+        node.set_hand_auto_confirm_enabled(req.auto_confirm_enabled)
+        return {
+            'success': True,
+            'hand_auto_confirm_enabled': node.is_hand_auto_confirm_enabled(),
+            **node.get_board_payload(),
+            **node.get_twin_live_payload(),
+        }
+
+    @app.post('/api/twin/config')
+    def twin_config(req: TwinConfigRequest) -> dict[str, Any]:
+        if not node._twin_enabled():
+            raise HTTPException(status_code=400, detail='sideview twin is not available in this launch')
+        node.set_twin_runtime_enabled(req.enabled)
+        return {
+            'success': True,
+            'twin_runtime_enabled': node.is_twin_runtime_enabled(),
+            **node.get_twin_live_payload(),
+            **node.get_board_payload(),
+        }
+
     @app.post('/api/voice-move')
     def voice_move(req: VoiceMoveRequest) -> dict[str, Any]:
         try:
-            result = node.execute_voice_player_move(req.transcript)
+            result = node.execute_voice_command(req.transcript)
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {**result, **node.get_board_payload()}
@@ -1807,6 +3585,26 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             raise HTTPException(status_code=503, detail='camera preview not available yet')
         return Response(content=jpeg, media_type='image/jpeg')
 
+    @app.get('/api/twin/webcam/preview.jpg')
+    def twin_webcam_preview() -> Response:
+        jpeg = node.get_sideview_jpeg()
+        if jpeg is None:
+            raise HTTPException(status_code=503, detail='side webcam preview not available yet')
+        return Response(content=jpeg, media_type='image/jpeg')
+
+    @app.get('/api/hand/preview.jpg')
+    def hand_preview() -> Response:
+        if not node._hand_enabled():
+            raise HTTPException(status_code=404, detail='hand detection is not enabled')
+        jpeg = node.get_hand_preview_jpeg()
+        if jpeg is None:
+            raise HTTPException(status_code=503, detail='hand preview not available yet')
+        return Response(content=jpeg, media_type='image/jpeg')
+
+    @app.get('/api/twin/live')
+    def twin_live() -> dict[str, Any]:
+        return node.get_twin_live_payload()
+
     @app.get('/api/camera/stream')
     async def camera_stream() -> StreamingResponse:
         async def generate():
@@ -1853,11 +3651,22 @@ def run_http_server(node: WebBridgeNode, app: FastAPI) -> None:
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = WebBridgeNode()
-    executor = MultiThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
+    node.attach_executor(executor)
+    spin_stop = threading.Event()
 
-    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    def _spin_executor() -> None:
+        while rclpy.ok() and not spin_stop.is_set():
+            try:
+                executor.spin_once(timeout_sec=0.1)
+            except Exception:  # noqa: BLE001
+                break
+
+    spin_thread = threading.Thread(target=_spin_executor, daemon=True, name='ros_executor_spin')
     spin_thread.start()
+    for _ in range(30):
+        time.sleep(0.05)
 
     app = create_app(node)
     try:
@@ -1865,6 +3674,8 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        spin_stop.set()
+        spin_thread.join(timeout=2.0)
         node.shutdown()
         executor.shutdown()
         node.destroy_node()

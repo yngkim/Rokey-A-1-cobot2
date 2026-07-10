@@ -28,7 +28,9 @@ export default function ChessBoard({
   const lastFrom = editable ? '' : (board.from ?? '');
   const lastTo = editable ? '' : (board.to ?? '');
 
-  const displayRows = flip ? [...fenBoard].reverse() : fenBoard;
+  const displayRows = flip
+    ? [...fenBoard].reverse().map((row) => [...row].reverse())
+    : fenBoard;
 
   return (
     <div className={`chess-board${editable ? ' chess-board-editing' : ''}`}>
@@ -37,8 +39,9 @@ export default function ChessBoard({
         return (
           <div className="rank" key={`rank-${rowIdx}`}>
             {row.map((piece, col) => {
-              const sq = squareName(col, rowFromTop);
-              const light = (col + rowFromTop) % 2 === 0;
+              const boardCol = flip ? 7 - col : col;
+              const sq = squareName(boardCol, rowFromTop);
+              const light = (boardCol + rowFromTop) % 2 === 0;
               const isLast =
                 sq === lastFrom || sq === lastTo ||
                 sq === highlightSquares?.from || sq === highlightSquares?.to;

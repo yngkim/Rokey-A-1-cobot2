@@ -24,6 +24,10 @@ class GraveyardState:
         self._fill_order = graveyard_fill_order(self.side)
         self.reset()
 
+    def set_side(self, side: str) -> None:
+        self.side = side.strip().lower()
+        self._fill_order = graveyard_fill_order(self.side)
+
     def reset(self) -> None:
         self.slots: list[str | None] = [None] * self.SLOT_COUNT
 

@@ -30,8 +30,10 @@ def generate_launch_description():
             'rgb_camera.color_profile': '1280x720x30',
             'initial_reset': 'true',
             'align_depth.enable': 'true',
-            'enable_rgbd': 'true',
-            'pointcloud.enable': 'true',
+            'enable_sync': 'true',
+            # Keep USB headroom for 1280x720 color (pointcloud/rgbd can force 640x480 fallback).
+            'enable_rgbd': 'false',
+            'pointcloud.enable': 'false',
             'serial_no': LaunchConfiguration('serial_no'),
         }.items(),
     )

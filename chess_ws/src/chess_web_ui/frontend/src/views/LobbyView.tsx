@@ -1,4 +1,9 @@
-import { DIFFICULTY_LABELS, Difficulty, HumanColor } from '../chess';
+import {
+  BoardOrientation,
+  DIFFICULTY_LABELS,
+  Difficulty,
+  HumanColor,
+} from '../chess';
 import type { TtsMode, TtsVoicePreset, UserSettings } from '../lib/userSettings';
 import {
   TTS_SAMPLE_TEXT,
@@ -8,9 +13,11 @@ import {
 import { loadVoicePresets, speakText } from '../lib/ttsVoices';
 
 const DIFFICULTY_INFO: Record<Difficulty, { title: string; desc: string; emoji: string }> = {
-  easy: { title: '쉬움', desc: 'Elo ~900 · 천천히 두는 초보 봇', emoji: '🌱' },
+  beginner: { title: '입문', desc: 'Elo ~700 · 천천히 두는 연습 봇', emoji: '🌱' },
+  easy: { title: '쉬움', desc: 'Elo ~900 · 천천히 두는 초보 봇', emoji: '🙂' },
   medium: { title: '보통', desc: 'Elo ~1500 · 아마추어 봇', emoji: '⚔️' },
-  hard: { title: '어려움', desc: '풀 파워 · 마스터 봇', emoji: '🔥' },
+  hard: { title: '어려움', desc: 'Elo ~2000 · 고수 봇', emoji: '🔥' },
+  master: { title: '마스터', desc: '풀 파워 · 마스터 봇', emoji: '👑' },
 };
 
 const VOICE_PRESETS: TtsVoicePreset[] = ['male1', 'male2', 'female1', 'female2'];
@@ -18,10 +25,12 @@ const VOICE_PRESETS: TtsVoicePreset[] = ['male1', 'male2', 'female1', 'female2']
 type Props = {
   difficulty: Difficulty;
   humanColor: HumanColor;
+  boardOrientation: BoardOrientation;
   busy: boolean;
   userSettings: UserSettings;
   onDifficulty: (d: Difficulty) => void;
   onColor: (c: HumanColor) => void;
+  onBoardOrientation: (o: BoardOrientation) => void;
   onUserSettings: (settings: UserSettings) => void;
   onStart: () => void;
 };
@@ -29,10 +38,12 @@ type Props = {
 export default function LobbyView({
   difficulty,
   humanColor,
+  boardOrientation,
   busy,
   userSettings,
   onDifficulty,
   onColor,
+  onBoardOrientation,
   onUserSettings,
   onStart,
 }: Props) {
@@ -61,7 +72,7 @@ export default function LobbyView({
       <h1>로봇 체스 대결</h1>
       <p className="lobby-sub">난이도와 색을 고른 뒤 실제 보드에서 대국을 시작하세요.</p>
 
-      <div className="difficulty-grid">
+      <div className="difficulty-grid difficulty-grid-5">
         {(Object.keys(DIFFICULTY_INFO) as Difficulty[]).map((key) => {
           const info = DIFFICULTY_INFO[key];
           return (
@@ -98,6 +109,30 @@ export default function LobbyView({
           ♚ 흑 (로봇 선수)
         </button>
       </div>
+
+      <div className="color-row">
+        <button
+          type="button"
+          className={`color-btn ${boardOrientation === 'standard' ? 'selected' : ''}`}
+          onClick={() => onBoardOrientation('standard')}
+          disabled={busy}
+        >
+          보드 표준 (a1 왼쪽 아래)
+        </button>
+        <button
+          type="button"
+          className={`color-btn ${boardOrientation === 'flipped' ? 'selected' : ''}`}
+          onClick={() => onBoardOrientation('flipped')}
+          disabled={busy}
+        >
+          보드 180° (a1 오른쪽 위)
+        </button>
+      </div>
+      {boardOrientation === 'flipped' ? (
+        <p className="lobby-sub lobby-hint">
+          180° 배치 시 empty_board_depth.npz와 보드 코너를 다시 캘리브하세요.
+        </p>
+      ) : null}
 
       <section className="tts-settings">
         <h2>음성 설정</h2>
@@ -149,6 +184,22 @@ export default function LobbyView({
             </button>
           ))}
         </div>
+      </section>
+
+      <section className="tts-settings">
+        <h2>손 감지</h2>
+        <p className="tts-hint">
+          사이드뷰 검증이 켜져 있을 때 동작합니다. 손이 보드에서 사라지면 RealSense로 수를 자동 확인합니다.
+        </p>
+        <label className="tts-toggle">
+          <input
+            type="checkbox"
+            checked={userSettings.hand_auto_confirm_enabled}
+            onChange={(e) => updateSettings({ hand_auto_confirm_enabled: e.target.checked })}
+            disabled={busy}
+          />
+          <span>손 감지 자동 수 확인 (기본 OFF)</span>
+        </label>
       </section>
 
       <button type="button" className="start-btn" onClick={onStart} disabled={busy}>

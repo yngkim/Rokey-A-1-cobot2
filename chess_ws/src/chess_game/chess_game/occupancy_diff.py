@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import chess
 
 from chess_game.board_utils import index_to_square_name, square_name_to_index
-from chess_game.move_resolve import captured_piece_symbol, resolve_legal_uci
+from chess_game.move_resolve import captured_piece_symbol, resolve_legal_uci, castle_rook_squares
 
 
 @dataclass
@@ -293,6 +293,43 @@ def infer_captured_piece(
     return ''
 
 
+def _pair_castling_move(
+    departed: list[str],
+    arrived: list[str],
+    fen: str,
+) -> tuple[str, str] | None:
+    """Detect castling when king/rook origins leave (destinations may stay occupied)."""
+    board = chess.Board(fen)
+    for move in board.legal_moves:
+        if not board.is_castling(move):
+            continue
+        from_sq = chess.square_name(move.from_square)
+        to_sq = chess.square_name(move.to_square)
+        if from_sq in departed and to_sq in arrived:
+            return from_sq, to_sq
+        rook = castle_rook_squares(move.uci()[:4])
+        if rook is None:
+            continue
+        rook_from, rook_to = rook
+        if len(departed) == 2 and from_sq in departed and rook_from in departed:
+            if not arrived or to_sq in arrived or rook_to in arrived:
+                return from_sq, to_sq
+        if len(departed) == 1 and from_sq in departed:
+            from_file = chess.square_file(move.from_square)
+            to_file = chess.square_file(move.to_square)
+            if abs(to_file - from_file) == 2:
+                return from_sq, to_sq
+    return None
+
+
+def castling_diff_pattern(
+    departed: list[str],
+    arrived: list[str],
+    fen: str,
+) -> bool:
+    return _pair_castling_move(departed, arrived, fen) is not None
+
+
 def _pair_departed_arrived(
     departed: list[str],
     arrived: list[str],
@@ -358,8 +395,14 @@ def detect_move_from_diff(
 
     if len(departed) == 2 and len(arrived) == 1:
         paired = _pair_capture_move(departed, arrived, fen)
+    elif len(departed) == 2 and len(arrived) in {0, 2}:
+        paired = _pair_castling_move(departed, arrived, fen)
+        if paired is None and len(arrived) == 2:
+            paired = _pair_departed_arrived(departed, arrived)
     else:
-        paired = _pair_departed_arrived(departed, arrived)
+        paired = _pair_castling_move(departed, arrived, fen)
+        if paired is None:
+            paired = _pair_departed_arrived(departed, arrived)
     if paired is not None:
         from_sq, to_sq = paired
         return DiffMoveResult(
@@ -385,6 +428,17 @@ def detect_move_from_diff(
             )
 
     if len(departed) == 2 and len(arrived) == 0:
+        paired = _pair_castling_move(departed, arrived, fen)
+        if paired is not None:
+            from_sq, to_sq = paired
+            return DiffMoveResult(
+                from_square=from_sq,
+                to_square=to_sq,
+                departed=departed,
+                arrived=arrived,
+                confident=True,
+                via_inference=False,
+            )
         paired = _pair_two_departed_capture(departed, fen)
         if paired is not None:
             from_sq, to_sq = paired
@@ -398,6 +452,17 @@ def detect_move_from_diff(
             )
 
     if len(departed) == 1 and len(arrived) == 0:
+        paired = _pair_castling_move(departed, arrived, fen)
+        if paired is not None:
+            from_sq, to_sq = paired
+            return DiffMoveResult(
+                from_square=from_sq,
+                to_square=to_sq,
+                departed=departed,
+                arrived=arrived,
+                confident=True,
+                via_inference=False,
+            )
         from_sq = departed[0]
         to_sq = _legal_destination_for_departed(from_sq, current_cells, previous_cells, fen)
         if to_sq is None:
