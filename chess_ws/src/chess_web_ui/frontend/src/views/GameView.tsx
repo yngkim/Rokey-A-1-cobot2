@@ -36,13 +36,18 @@ type Props = {
   onConfirmMove: () => void;
   onReset: () => void;
   onRestore: () => void;
+  onSave: () => void;
+  saveBusy: boolean;
   onBackToLobby: () => void;
   onResign: () => void;
   onUndo: () => void;
   onVoiceMove: () => void;
+  onRobotStop: () => void;
+  stopBusy: boolean;
   onTwinVerify: () => void;
   onTwinToggle: (enabled: boolean) => void;
   onHandAutoConfirmToggle: (enabled: boolean) => void;
+  onHandSafetyToggle: (enabled: boolean) => void;
   voiceListening: boolean;
   voiceInterimText?: string;
   onBoardCorrect: (
@@ -65,13 +70,18 @@ export default function GameView({
   onConfirmMove,
   onReset,
   onRestore,
+  onSave,
+  saveBusy,
   onBackToLobby,
   onResign,
   onUndo,
   onVoiceMove,
+  onRobotStop,
+  stopBusy,
   onTwinVerify,
   onTwinToggle,
   onHandAutoConfirmToggle,
+  onHandSafetyToggle,
   voiceListening,
   voiceInterimText,
   onBoardCorrect,
@@ -89,7 +99,12 @@ export default function GameView({
   const emptyGraveyard = () => Array.from({ length: 16 }, () => null as string | null);
 
   const humanTurn = isHumanTurn(board);
-  const botBusy = board.bot_status === 'thinking' || board.bot_status === 'moving';
+  const robotActive =
+    board.bot_status === 'thinking' ||
+    board.bot_status === 'moving' ||
+    board.bot_status === 'paused' ||
+    board.bot_status === 'stopped';
+  const botBusy = robotActive;
   const gameFinished = board.game_phase === 'finished';
 
   const gameOverTitle = useMemo(() => {
@@ -201,7 +216,11 @@ export default function GameView({
 
   const handleSave = async () => {
     if (!draftGrid || validationError) return;
-    const fen = buildFenFromGrid(draftGrid, draftWhiteToMove ? 'w' : 'b');
+    const fen = buildFenFromGrid(
+      draftGrid,
+      draftWhiteToMove ? 'w' : 'b',
+      board.fen,
+    );
     setSaving(true);
     try {
       await onBoardCorrect(fen, {
@@ -247,10 +266,14 @@ export default function GameView({
             onConfirm={onConfirmMove}
             onReset={onReset}
             onRestore={onRestore}
+            onSave={onSave}
             onEdit={startEditing}
             onResign={onResign}
             onUndo={onUndo}
             onVoiceMove={onVoiceMove}
+            onRobotStop={onRobotStop}
+            stopDisabled={!robotActive || gameFinished}
+            stopBusy={stopBusy}
             confirmDisabled={!humanTurn || botBusy || gameFinished}
             confirmBusy={busy}
             voiceDisabled={!humanTurn || botBusy || gameFinished || busy}
@@ -259,6 +282,8 @@ export default function GameView({
             resetDisabled={botBusy || busy}
             restoreDisabled={botBusy || busy}
             restoreBusy={busy}
+            saveDisabled={botBusy || busy}
+            saveBusy={saveBusy}
             editDisabled={botBusy || busy}
             resignDisabled={botBusy || busy || gameFinished}
             undoDisabled={botBusy || busy || gameFinished || !board.undo_available}
@@ -344,10 +369,12 @@ export default function GameView({
             available={board.twin_available ?? true}
             handAvailable={board.hand_available ?? false}
             handAutoConfirmEnabled={board.hand_auto_confirm_enabled ?? false}
+            handSafetyEnabled={board.hand_safety_enabled ?? true}
             busy={busy}
             onVerify={onTwinVerify}
             onToggleRuntime={onTwinToggle}
             onToggleHandAutoConfirm={onHandAutoConfirmToggle}
+            onToggleHandSafety={onHandSafetyToggle}
             onApplyCandidate={applyTwinCandidate}
           />
           <MoveList

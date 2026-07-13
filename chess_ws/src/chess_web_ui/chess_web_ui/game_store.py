@@ -176,6 +176,39 @@ class GameStore:
             return None
         return GameRecord.from_row(row)
 
+    def load_game(self, game_id: str) -> GameRecord | None:
+        game_id = (game_id or '').strip()
+        if not game_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                'SELECT * FROM games WHERE id = ?',
+                (game_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return GameRecord.from_row(row)
+
+    def list_games(self, *, limit: int = 20) -> list[GameRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                'SELECT * FROM games ORDER BY updated_at DESC LIMIT ?',
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [GameRecord.from_row(row) for row in rows]
+
+    def mark_active(self, game_id: str) -> None:
+        game_id = (game_id or '').strip()
+        if not game_id:
+            return
+        self.deactivate_all()
+        with self._connect() as conn:
+            conn.execute(
+                'UPDATE games SET is_active = 1, updated_at = ? WHERE id = ?',
+                (_utc_now(), game_id),
+            )
+            conn.commit()
+
     def deactivate_all(self) -> None:
         with self._connect() as conn:
             conn.execute('UPDATE games SET is_active = 0')

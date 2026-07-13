@@ -14,10 +14,17 @@ import {
   postTwinVerify,
   postTwinConfig,
   postHandConfig,
+  postHandSafetyConfig,
   postUndo,
   postVoiceMove,
+  postResumeGame,
+  postSaveGame,
+  postLoadGame,
   resetBoard,
   restoreBoard,
+  stopRobot,
+  resumeRobot,
+  abortRobot,
 } from './chess';
 import { useBotTts } from './hooks/useBotTts';
 import { useVoiceCommand } from './hooks/useVoiceCommand';
@@ -26,6 +33,7 @@ import LobbyView from './views/LobbyView';
 import GameView from './views/GameView';
 import PromotionModal from './components/PromotionModal';
 import IllegalMoveModal from './components/IllegalMoveModal';
+import RobotStopModal from './components/RobotStopModal';
 import './styles/chess-theme.css';
 
 export default function App() {
@@ -46,6 +54,9 @@ export default function App() {
     null,
   );
   const [boardEditRequest, setBoardEditRequest] = useState(0);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const [showStopModal, setShowStopModal] = useState(false);
+  const [stopBusy, setStopBusy] = useState(false);
   const { state: voiceState, interimTranscript, startListening } = useVoiceCommand();
   const voiceListening = voiceState === 'listening' || voiceState === 'processing';
 
@@ -62,11 +73,17 @@ export default function App() {
       if (data.human_color) setHumanColor(data.human_color);
       if (data.difficulty) setDifficulty(data.difficulty);
       if (data.board_orientation) setBoardOrientation(data.board_orientation);
-      if (data.game_phase === 'playing') setScreen('game');
+      if (data.game_phase === 'playing' || data.game_phase === 'finished') {
+        setScreen('game');
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : '보드 로드 실패');
     }
   }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
 
   useEffect(() => {
     if (screen !== 'game') return undefined;
@@ -80,6 +97,68 @@ export default function App() {
     const timer = window.setInterval(() => setCameraTick(Date.now()), 100);
     return () => window.clearInterval(timer);
   }, [screen]);
+
+  useEffect(() => {
+    if (board?.user_stop_pending) {
+      setShowStopModal(true);
+    }
+  }, [board?.user_stop_pending]);
+
+  const applyBoardState = (data: BoardResponse) => {
+    setBoard(data);
+    if (data.human_color) setHumanColor(data.human_color);
+    if (data.difficulty) setDifficulty(data.difficulty);
+    if (data.board_orientation) setBoardOrientation(data.board_orientation);
+    if (data.game_phase === 'playing' || data.game_phase === 'finished') {
+      setScreen('game');
+    }
+  };
+
+  const handleResume = async () => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postResumeGame();
+      applyBoardState(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '게임 이어하기 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleLoadGame = async (gameId: string) => {
+    if (
+      !window.confirm(
+        '선택한 게임을 불러옵니다. 논리 보드와 로봇이 저장 시점 상태로 맞춰집니다. 계속할까요?',
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postLoadGame(gameId);
+      applyBoardState(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '게임 불러오기 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSaveGame = async () => {
+    setSaveBusy(true);
+    setError('');
+    try {
+      const data = await postSaveGame();
+      setBoard(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '게임 저장 실패');
+    } finally {
+      setSaveBusy(false);
+    }
+  };
 
   const handleStart = async () => {
     setBusy(true);
@@ -227,6 +306,19 @@ export default function App() {
     }
   };
 
+  const handleHandSafetyToggle = async (enabled: boolean) => {
+    setBusy(true);
+    setError('');
+    try {
+      const data = await postHandSafetyConfig(enabled);
+      setBoard(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '손 감지 안전정지 설정 실패');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleTwinVerify = async () => {
     setBusy(true);
     setError('');
@@ -318,6 +410,48 @@ export default function App() {
     }
   };
 
+  const handleRobotStop = async () => {
+    setStopBusy(true);
+    setError('');
+    try {
+      const data = await stopRobot();
+      setBoard(data);
+      setShowStopModal(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '로봇 정지 실패');
+    } finally {
+      setStopBusy(false);
+    }
+  };
+
+  const handleRobotResume = async () => {
+    setStopBusy(true);
+    setError('');
+    try {
+      const data = await resumeRobot();
+      setBoard(data);
+      setShowStopModal(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '로봇 재개 실패');
+    } finally {
+      setStopBusy(false);
+    }
+  };
+
+  const handleRobotAbort = async () => {
+    setStopBusy(true);
+    setError('');
+    try {
+      const data = await abortRobot();
+      setBoard(data);
+      setShowStopModal(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '로봇 중단 실패');
+    } finally {
+      setStopBusy(false);
+    }
+  };
+
   return (
     <div className="app-shell">
       {error ? (
@@ -335,6 +469,8 @@ export default function App() {
           onBoardOrientation={setBoardOrientation}
           onUserSettings={setUserSettings}
           onStart={handleStart}
+          onResume={handleResume}
+          onLoadGame={handleLoadGame}
         />
       ) : board ? (
         <GameView
@@ -347,13 +483,18 @@ export default function App() {
           onConfirmMove={handleConfirmMove}
           onReset={handleReset}
           onRestore={handleRestore}
+          onSave={handleSaveGame}
+          saveBusy={saveBusy}
           onBackToLobby={handleBackToLobby}
           onResign={handleResign}
           onUndo={handleUndo}
           onVoiceMove={handleVoiceMove}
+          onRobotStop={handleRobotStop}
+          stopBusy={stopBusy}
           onTwinVerify={handleTwinVerify}
           onTwinToggle={handleTwinToggle}
           onHandAutoConfirmToggle={handleHandAutoConfirmToggle}
+          onHandSafetyToggle={handleHandSafetyToggle}
           voiceListening={voiceListening}
           voiceInterimText={interimTranscript}
           onBoardCorrect={handleBoardCorrect}
@@ -380,6 +521,13 @@ export default function App() {
           onBoardEdit={handleIllegalBoardEdit}
           onAutoRevert={handleIllegalAutoRevert}
           onCancel={() => setPendingIllegalMove(null)}
+        />
+      ) : null}
+      {showStopModal ? (
+        <RobotStopModal
+          busy={stopBusy || busy}
+          onResume={handleRobotResume}
+          onAbort={handleRobotAbort}
         />
       ) : null}
     </div>

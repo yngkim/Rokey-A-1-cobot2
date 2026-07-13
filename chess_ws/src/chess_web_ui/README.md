@@ -91,7 +91,7 @@ ros2 launch chess_web_ui vision_manual.launch.py use_fake:=true
 **observe 홈 관절각** (`robot_params.yaml`의 `home_joints`):
 
 ```yaml
-home_joints: [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17]
+home_joints: [-12.32, 22.41, 36.08, -0.09, 121.46, -13.86]
 ```
 
 - Reset / `move_to_observe` / 수 실행 후 복귀 시 모두 이 자세로 이동합니다.

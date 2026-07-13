@@ -64,18 +64,31 @@ class StockfishClient:
     def start(self) -> None:
         if self._engine is None:
             self._engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
+            self._engine_available = True
 
     def stop(self) -> None:
         if self._engine is not None:
             self._engine.quit()
             self._engine = None
 
+    def _reset_engine(self) -> None:
+        """Drop a dead/corrupted engine handle so the next call restarts a fresh
+        subprocess. Without this, a single UCI protocol error (e.g. from a
+        concurrent, unsynchronized call — see configure_opponent callers) leaves
+        self._engine permanently broken: start() no-ops because it's not None, so
+        every future choose_move() silently falls back to legal_moves[0] forever,
+        regardless of difficulty."""
+        if self._engine is not None:
+            try:
+                self._engine.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._engine = None
+
     def configure_opponent(self, difficulty: Difficulty) -> None:
         self._difficulty = difficulty
         preset = DIFFICULTY_PRESETS[difficulty]
         self.depth = int(preset['depth'])
-        if not self._engine_available:
-            return
         try:
             self.start()
             assert self._engine is not None
@@ -91,6 +104,7 @@ class StockfishClient:
                     'Skill Level': int(preset['skill_level']),
                 })
         except (FileNotFoundError, chess.engine.EngineError):
+            self._reset_engine()
             self._engine_available = False
 
     def best_move_uci(self, fen: str) -> str:
@@ -111,6 +125,7 @@ class StockfishClient:
                 raise RuntimeError('engine returned no move')
             return result.move.uci()
         except (FileNotFoundError, chess.engine.EngineError):
+            self._reset_engine()
             self._engine_available = False
             legal_moves = list(board.legal_moves)
             if not legal_moves:
@@ -132,6 +147,7 @@ class StockfishClient:
             info = self._engine.analyse(board, chess.engine.Limit(depth=depth))
             return self._score_to_cp(info['score'])
         except (FileNotFoundError, chess.engine.EngineError):
+            self._reset_engine()
             self._engine_available = False
             return 0
 
@@ -161,6 +177,7 @@ class StockfishClient:
             if result.move is not None:
                 return result.move.uci()
         except (FileNotFoundError, chess.engine.EngineError):
+            self._reset_engine()
             self._engine_available = False
         legal_moves = list(board.legal_moves)
         if not legal_moves:

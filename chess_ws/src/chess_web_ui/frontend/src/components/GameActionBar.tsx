@@ -2,14 +2,18 @@ type Props = {
   onConfirm: () => void;
   onReset: () => void;
   onRestore: () => void;
+  onSave: () => void;
   onEdit: () => void;
   onResign: () => void;
   onUndo: () => void;
   onVoiceMove: () => void;
+  onRobotStop: () => void;
   confirmDisabled: boolean;
   confirmBusy: boolean;
   resetDisabled: boolean;
   restoreDisabled: boolean;
+  saveDisabled: boolean;
+  saveBusy: boolean;
   editDisabled: boolean;
   resignDisabled: boolean;
   undoDisabled: boolean;
@@ -17,6 +21,8 @@ type Props = {
   voiceDisabled: boolean;
   voiceListening: boolean;
   voiceInterimText?: string;
+  stopDisabled: boolean;
+  stopBusy: boolean;
   editing: boolean;
   restoreBusy: boolean;
 };
@@ -25,14 +31,18 @@ export default function GameActionBar({
   onConfirm,
   onReset,
   onRestore,
+  onSave,
   onEdit,
   onResign,
   onUndo,
   onVoiceMove,
+  onRobotStop,
   confirmDisabled,
   confirmBusy,
   resetDisabled,
   restoreDisabled,
+  saveDisabled,
+  saveBusy,
   editDisabled,
   resignDisabled,
   undoDisabled,
@@ -40,6 +50,8 @@ export default function GameActionBar({
   voiceDisabled,
   voiceListening,
   voiceInterimText,
+  stopDisabled,
+  stopBusy,
   editing,
   restoreBusy,
 }: Props) {
@@ -95,10 +107,27 @@ export default function GameActionBar({
         <button
           type="button"
           className="action-btn action-btn-secondary"
+          onClick={onSave}
+          disabled={saveDisabled || confirmBusy || editing || saveBusy || voiceListening}
+        >
+          {saveBusy ? '저장 중…' : '저장'}
+        </button>
+        <button
+          type="button"
+          className="action-btn action-btn-secondary"
           onClick={onEdit}
           disabled={editDisabled || confirmBusy || editing || voiceListening}
         >
           보드 수정
+        </button>
+        <button
+          type="button"
+          className="action-btn action-btn-danger"
+          onClick={onRobotStop}
+          disabled={stopDisabled || stopBusy || editing || voiceListening}
+          title="로봇 팔 동작 즉시 정지"
+        >
+          {stopBusy ? '정지 중…' : '정지'}
         </button>
         <button
           type="button"

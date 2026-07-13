@@ -5,11 +5,13 @@ type Props = {
   runtimeEnabled: boolean;
   available: boolean;
   handAutoConfirmEnabled?: boolean;
+  handSafetyEnabled?: boolean;
   handAvailable?: boolean;
   busy: boolean;
   onVerify: () => void;
   onToggleRuntime: (enabled: boolean) => void;
   onToggleHandAutoConfirm?: (enabled: boolean) => void;
+  onToggleHandSafety?: (enabled: boolean) => void;
   onApplyCandidate?: (fen: string) => void;
 };
 
@@ -18,11 +20,13 @@ export default function TwinPanel({
   runtimeEnabled,
   available,
   handAutoConfirmEnabled = false,
+  handSafetyEnabled = true,
   handAvailable = false,
   busy,
   onVerify,
   onToggleRuntime,
   onToggleHandAutoConfirm,
+  onToggleHandSafety,
   onApplyCandidate,
 }: Props) {
   const candidate = report?.suggestions?.find(
@@ -96,6 +100,23 @@ export default function TwinPanel({
           />
           <span>손 감지 자동 수 확인</span>
         </label>
+      ) : null}
+      {handAvailable ? (
+        <label className="twin-toggle twin-hand-toggle">
+          <input
+            type="checkbox"
+            checked={handSafetyEnabled}
+            disabled={busy}
+            onChange={(e) => onToggleHandSafety?.(e.target.checked)}
+          />
+          <span>손 감지 시 로봇 정지</span>
+        </label>
+      ) : null}
+      {handAvailable && !handSafetyEnabled ? (
+        <p className="twin-hand-hint twin-hand-warn">
+          꺼짐 — 손이 보드 위에 있어도 로봇이 멈추지 않습니다. 오탐이 잦을 때만 끄고,
+          실제로 손을 보드에 넣을 땐 직접 정지 버튼을 쓰세요.
+        </p>
       ) : null}
       {handAvailable ? (
         <p className="twin-hand-hint">
