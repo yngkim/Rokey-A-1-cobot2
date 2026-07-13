@@ -1,0 +1,21 @@
+# Python (pip) dependencies for Rokey-A-1-cobot2.
+# ROS2 packages themselves (rclpy, cv_bridge, realsense2_camera, dsr_msgs2, ...)
+# come from apt/rosdep, not pip — see README.md "의존성" section.
+
+# 체스 로직 / 엔진
+chess>=1.11
+
+# 웹 백엔드 (chess_web_ui: web_bridge.py)
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# 비전 / 딥러닝 (chess_piece_classifier, board_twin 손 감지, chess_occupancy YOLO 보조)
+numpy>=1.26,<2
+opencv-python>=4.9
+ultralytics>=8.2
+huggingface_hub>=0.22
+torch>=2.2
+
+# 설정 파일 파싱
+PyYAML>=5.4
