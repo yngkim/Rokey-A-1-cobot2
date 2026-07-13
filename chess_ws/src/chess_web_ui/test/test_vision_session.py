@@ -209,3 +209,49 @@ def test_promotion_requires_ui_choice() -> None:
     assert piece.piece_type == chess.QUEEN
     assert promoted.promotion_piece == 'q'
 
+
+def test_detect_move_with_a2_ghost_departed() -> None:
+    """Stale a2 departed noise must not block a real e7→e5 black move."""
+    fen = 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1'
+    session = VisionSession()
+    session.game = GameState(fen)
+    baseline = occupancy_from_fen(fen)
+    session.previous_cells = list(baseline)
+
+    after = list(baseline)
+    a2 = chess.square(0, 1)
+    e7 = chess.square(4, 6)
+    e5 = chess.square(4, 4)
+    after[a2] = False  # ghost: scan says a2 empty though FEN still has pawn
+    after[e7] = False
+    after[e5] = True
+
+    outcome = session.apply_player_move_scan(after)
+    assert outcome.success
+    assert outcome.from_square == 'e7'
+    assert outcome.to_square == 'e5'
+
+
+def test_detect_single_square_capture_with_no_arrived_square() -> None:
+    """A capture onto a square that stays occupied the whole time (piece taken,
+    capturer arrives) never produces an "arrived" signal. This used to get
+    pruned as depth-sensor noise because the pre-move FEN always still shows a
+    piece at the departed square — true for every real move, not just ghosts —
+    silently dropping every single-square capture (e.g. Nxb4) as "no move
+    detected"."""
+    fen = '4k3/8/2n5/8/1P6/8/8/4K3 b - - 0 1'
+    session = VisionSession()
+    session.game = GameState(fen)
+    baseline = occupancy_from_fen(fen)
+    session.previous_cells = list(baseline)
+
+    after = list(baseline)
+    c6 = chess.square(2, 5)
+    after[c6] = False  # knight departs c6; b4 (pawn captured, knight lands) stays occupied
+
+    outcome = session.apply_player_move_scan(after)
+    assert outcome.success
+    assert outcome.from_square == 'c6'
+    assert outcome.to_square == 'b4'
+    assert outcome.captured_piece
+

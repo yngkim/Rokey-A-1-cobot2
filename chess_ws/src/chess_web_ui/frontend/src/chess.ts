@@ -1,4 +1,4 @@
-export type BotStatus = 'idle' | 'thinking' | 'moving' | 'paused' | 'error';
+export type BotStatus = 'idle' | 'thinking' | 'moving' | 'paused' | 'stopped' | 'error';
 export type Difficulty = 'beginner' | 'easy' | 'medium' | 'hard' | 'master';
 export type HumanColor = 'white' | 'black';
 export type BoardOrientation = 'standard' | 'flipped';
@@ -42,6 +42,27 @@ export type BotSpeechKind =
   | 'illegal_move'
   | 'voice_move';
 
+export type SavedGameSummary = {
+  id: string;
+  updated_at: string;
+  created_at: string;
+  is_active: boolean;
+  fen: string;
+  human_color: HumanColor;
+  difficulty: Difficulty;
+  board_orientation?: BoardOrientation;
+  game_phase: GamePhase;
+  game_result?: GameResult;
+  winner?: 'human' | 'robot' | 'draw' | '';
+  move_count: number;
+  ply_counter: number;
+  bot_message?: string;
+};
+
+export type SavedGamesResponse = {
+  games: SavedGameSummary[];
+};
+
 export type BoardResponse = {
   fen: string;
   occupancy: boolean[];
@@ -73,6 +94,7 @@ export type BoardResponse = {
   graveyard_slots?: (string | null)[];
   human_graveyard_slots?: (string | null)[];
   undo_available?: boolean;
+  user_stop_pending?: boolean;
   promotion_required?: boolean;
   illegal_move?: boolean;
   parse_error?: boolean;
@@ -84,6 +106,7 @@ export type BoardResponse = {
   twin_runtime_enabled?: boolean;
   hand_available?: boolean;
   hand_auto_confirm_enabled?: boolean;
+  hand_safety_enabled?: boolean;
 };
 
 export type TwinMismatch = {
@@ -137,7 +160,7 @@ export function cloneBoardGrid(grid: (string | null)[][]): (string | null)[][] {
 export function buildFenFromGrid(
   grid: (string | null)[][],
   activeColor: 'w' | 'b',
-  fullmove = 1,
+  sourceFen?: string,
 ): string {
   const placement = grid
     .map((row) => {
@@ -158,7 +181,20 @@ export function buildFenFromGrid(
       return fenRow || '8';
     })
     .join('/');
-  return `${placement} ${activeColor} - - 0 ${fullmove}`;
+  const source = (sourceFen || '').trim().split(/\s+/);
+  if (source.length >= 6) {
+    const castling = source[2] || '-';
+    const ep = source[3] || '-';
+    const halfmove = source[4] || '0';
+    const fullmove = source[5] || '1';
+    return `${placement} ${activeColor} ${castling} ${ep} ${halfmove} ${fullmove}`;
+  }
+  // sourceFen missing/malformed — this would silently reset castling/halfmove/
+  // fullmove for an in-progress game if it ever reached the backend, so flag it
+  // loudly instead of failing silently (backend also guards against this in
+  // correct_board, but this should never happen in the first place).
+  console.warn('buildFenFromGrid: no valid sourceFen provided, counters reset to defaults', sourceFen);
+  return `${placement} ${activeColor} - - 0 1`;
 }
 
 export function countKings(grid: (string | null)[][]): { white: number; black: number } {
@@ -355,6 +391,38 @@ export async function readBoardResponse(res: Response): Promise<BoardResponse> {
   }
 }
 
+export async function fetchSavedGames(): Promise<SavedGameSummary[]> {
+  const res = await fetch('/api/games');
+  if (!res.ok) throw new Error('저장된 게임 목록을 불러오지 못했습니다');
+  const data = (await res.json()) as SavedGamesResponse;
+  return data.games ?? [];
+}
+
+export async function postSaveGame(): Promise<BoardResponse> {
+  const res = await fetch('/api/games/save', { method: 'POST' });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? '게임 저장 실패');
+  return data;
+}
+
+export async function postLoadGame(gameId: string): Promise<BoardResponse> {
+  const res = await fetch('/api/games/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ game_id: gameId }),
+  });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? '게임 불러오기 실패');
+  return data;
+}
+
+export async function postResumeGame(): Promise<BoardResponse> {
+  const res = await fetch('/api/games/resume', { method: 'POST' });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? '게임 이어하기 실패');
+  return data;
+}
+
 export async function fetchBoard(): Promise<BoardResponse> {
   const res = await fetch('/api/board');
   if (!res.ok) throw new Error('failed to fetch board');
@@ -390,6 +458,17 @@ export async function postHandConfig(enabled: boolean): Promise<BoardResponse> {
   });
   const data = await readBoardResponse(res);
   if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'hand config failed');
+  return data;
+}
+
+export async function postHandSafetyConfig(enabled: boolean): Promise<BoardResponse> {
+  const res = await fetch('/api/hand/config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ safety_enabled: enabled }),
+  });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'hand safety config failed');
   return data;
 }
 
@@ -453,6 +532,27 @@ export async function postUndo(): Promise<BoardResponse> {
   const res = await fetch('/api/undo', { method: 'POST' });
   const data = await readBoardResponse(res);
   if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'undo failed');
+  return data;
+}
+
+export async function stopRobot(): Promise<BoardResponse> {
+  const res = await fetch('/api/robot/stop', { method: 'POST' });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'robot stop failed');
+  return data;
+}
+
+export async function resumeRobot(): Promise<BoardResponse> {
+  const res = await fetch('/api/robot/stop/resume', { method: 'POST' });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'robot resume failed');
+  return data;
+}
+
+export async function abortRobot(): Promise<BoardResponse> {
+  const res = await fetch('/api/robot/stop/abort', { method: 'POST' });
+  const data = await readBoardResponse(res);
+  if (!res.ok) throw new Error((data as { detail?: string }).detail ?? 'robot abort failed');
   return data;
 }
 
@@ -540,6 +640,7 @@ export function turnLabel(board: BoardResponse | null): string {
   if (board.bot_status === 'thinking') return '로봇 생각 중…';
   if (board.bot_status === 'moving') return '로봇 이동 중…';
   if (board.bot_status === 'paused') return '손 감지 — 로봇 일시정지';
+  if (board.bot_status === 'stopped') return '로봇 정지 — 계속 또는 홈 복귀 선택';
   if (board.bot_status === 'error') return '로봇 오류';
   if (!isHumanTurn(board)) {
     return `차례: ${board.robot_color === 'white' ? '백' : '흑'}(로봇)`;

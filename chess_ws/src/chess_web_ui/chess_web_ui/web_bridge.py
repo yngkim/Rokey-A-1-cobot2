@@ -27,6 +27,7 @@ from chess_game.move_resolve import (
     resolve_legal_uci_full,
 )
 from chess_engine.stockfish_client import StockfishClient
+from chess_web_ui.agent_debug_log import agent_log
 from chess_web_ui.bot_banter import (
     Difficulty,
     get_bot_profile,
@@ -51,7 +52,7 @@ from chess_web_ui.bot_banter import (
     react_to_voice_undo_fail,
     react_to_voice_undo_success,
 )
-from chess_web_ui.board_correct_utils import infer_human_move_uci
+from chess_web_ui.board_correct_utils import guard_correction_fen, infer_human_move_uci
 from chess_web_ui.capture_utils import resolve_capture_symbol
 from chess_web_ui.voice_game_parser import parse_game_voice_command
 from chess_web_ui.voice_move_parser import (
@@ -107,8 +108,9 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
+from std_srvs.srv import Trigger
 
-BotStatus = Literal['idle', 'thinking', 'moving', 'paused', 'error']
+BotStatus = Literal['idle', 'thinking', 'moving', 'paused', 'stopped', 'error']
 
 
 class MoveRequest(BaseModel):
@@ -126,7 +128,8 @@ class GameConfigRequest(BaseModel):
 
 
 class HandConfigRequest(BaseModel):
-    auto_confirm_enabled: bool
+    auto_confirm_enabled: bool | None = None
+    safety_enabled: bool | None = None
 
 
 class BoardCorrectRequest(BaseModel):
@@ -153,6 +156,10 @@ class VoiceMoveRequest(BaseModel):
 class TwinVerifyRequest(BaseModel):
     confirm_failed: bool = False
     use_fresh_scan: bool = True
+
+
+class LoadGameRequest(BaseModel):
+    game_id: str
 
 
 class TwinConfigRequest(BaseModel):
@@ -276,6 +283,15 @@ class WebBridgeNode(Node):
         self._hand_present = False
         self._hand_inference_busy = False
         self._hand_raw_in_board_prev = False
+        # Single-frame hand detections are noisy (motion blur off the moving
+        # gripper, glare, etc.) and used to feed the robot's SafetyGate on every
+        # frame with zero smoothing — a single spurious frame was enough to pause
+        # an in-flight move, then resume, over and over. Require 2 consecutive
+        # raw detections before treating it as active for the robot; a real hand
+        # clears instantly (streak resets to 0) so no safety latency is added on
+        # the way out, only a ~1-frame delay confirming a hand actually arrived.
+        self._hand_raw_streak = 0
+        self._hand_raw_confirm_frames = 2
         self._hand_safety_paused = False
         self._bot_status_before_pause: BotStatus = 'idle'
         self._hand_left_at = 0.0
@@ -289,6 +305,7 @@ class WebBridgeNode(Node):
         self._pending_vision_auto_move: tuple[str, str, str] | None = None
         self._vision_auto_move_in_progress = False
         self._last_bot_resume_attempt_at = 0.0
+        self._last_recovery_sync_at = 0.0
         self._hand_last_published_in_board: bool | None = None
         self._bot_activity_started_at = 0.0
         self._hand_jpeg: bytes | None = None
@@ -298,6 +315,7 @@ class WebBridgeNode(Node):
         self._hand_auto_confirm_runtime = bool(
             self.get_parameter('hand_auto_confirm_enabled').value
         )
+        self._hand_safety_runtime = bool(self.get_parameter('hand_safety_enabled').value)
         self._restore_in_progress = False
         self._board_reset_in_progress = False
         self._active_move_goal_handle = None
@@ -305,6 +323,7 @@ class WebBridgeNode(Node):
         self._executor: MultiThreadedExecutor | None = None
         self._service_call_lock = threading.Lock()
         self._active_game_id = ''
+        self._saved_game_restored = False
         db_path = str(self.get_parameter('game_db_path').value)
         self._game_store = GameStore(db_path)
 
@@ -319,6 +338,7 @@ class WebBridgeNode(Node):
         self._bot_worker_thread: threading.Thread | None = None
         self._bot_cancel_requested = False
         self._bot_session_active = False
+        self._user_stop_pending = False
         self._engine_lock = threading.Lock()
         engine_depth = int(self.get_parameter('engine_depth').value)
         self._engine = StockfishClient(depth=engine_depth)
@@ -384,12 +404,112 @@ class WebBridgeNode(Node):
         self.restore_action_client = ActionClient(self, RestoreBoard, 'robot/restore_board')
         self.robot_set_board_client = self.create_client(SetBoard, 'robot/set_board')
         self.robot_undo_client = self.create_client(UndoMoves, 'robot/undo_moves')
+        self.robot_user_stop_client = self.create_client(Trigger, 'robot/user_stop')
+        self.robot_user_stop_resume_client = self.create_client(Trigger, 'robot/user_stop_resume')
+        self.robot_user_stop_abort_client = self.create_client(Trigger, 'robot/user_stop_abort')
         self.get_logger().info(
             f'Web bridge ready (human={self._human_color()}, auto_bot={self._auto_bot_move()}, '
             f'db={self._game_store.db_path})'
         )
         if bool(self.get_parameter('restore_saved_game').value):
-            self._restore_timer = self.create_timer(4.0, self._try_restore_saved_game)
+            self._restore_timer = self.create_timer(2.0, self._try_restore_saved_game)
+
+    def _game_record_summary(self, record: GameRecord) -> dict[str, Any]:
+        return {
+            'id': record.id,
+            'updated_at': record.updated_at,
+            'created_at': record.created_at,
+            'is_active': record.is_active,
+            'fen': record.fen,
+            'human_color': record.human_color,
+            'difficulty': record.difficulty,
+            'board_orientation': record.board_orientation,
+            'game_phase': record.game_phase,
+            'game_result': record.game_result,
+            'winner': record.winner,
+            'move_count': len(record.move_history),
+            'ply_counter': record.ply_counter,
+            'bot_message': record.bot_message,
+        }
+
+    def list_saved_games(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        return [self._game_record_summary(r) for r in self._game_store.list_games(limit=limit)]
+
+    def save_current_game(self) -> tuple[bool, str]:
+        if self.game_phase == 'lobby' and not self._active_game_id:
+            return False, '저장할 진행 중인 게임이 없습니다'
+        self._ensure_active_game()
+        try:
+            record = self._game_record()
+            self._game_store.mark_active(record.id)
+            record.is_active = True
+            self._game_store.save_game(record)
+        except Exception as exc:  # noqa: BLE001
+            return False, f'저장 실패: {exc}'
+        self.latest_message = '게임을 저장했습니다'
+        return True, 'saved'
+
+    def _apply_loaded_game(self, record: GameRecord, *, message: str) -> tuple[bool, str]:
+        self._game_store.mark_active(record.id)
+        record.is_active = True
+        self._prepare_robot_for_reset()
+        self._apply_game_record(record)
+        with self._bot_lock:
+            self._bot_busy = False
+            self._bot_pending_fen = ''
+        self.bot_status = 'idle'
+        self._hand_safety_paused = False
+        self._reset_hand_tracking()
+
+        logical_ok, logical_msg = self._sync_logical_board(record.fen)
+        if not logical_ok:
+            self.get_logger().warn(f'vision sync on load failed: {logical_msg}')
+        sync_ok, sync_msg = self._sync_robot_board(record.fen)
+        if not sync_ok:
+            self.get_logger().warn(f'robot sync on load failed: {sync_msg}')
+        self._refresh_game_phase(record.fen)
+        self.eval_cp = self._eval_from_human_perspective_safe()
+        self._bot_session_active = record.game_phase == 'playing'
+        self.latest_message = message
+        self._spin_for_updates()
+        self._persist_game_state()
+        if (
+            self._bot_session_active
+            and self.game_phase == 'playing'
+            and self._auto_bot_move()
+            and self._is_robot_turn(self.latest_white_to_move)
+        ):
+            self._maybe_play_bot_move(self.latest_fen)
+        return True, message
+
+    def load_saved_game(self, game_id: str) -> tuple[bool, str]:
+        record = self._game_store.load_game(game_id)
+        if record is None:
+            return False, '저장된 게임을 찾을 수 없습니다'
+        return self._apply_loaded_game(
+            record,
+            message='게임을 불러왔습니다. 실제 보드와 다르면 「보드 정리」를 사용하세요.',
+        )
+
+    def resume_active_saved_game(self) -> tuple[bool, str]:
+        record = self._game_store.load_active_game()
+        if record is None or record.game_phase == 'lobby':
+            return False, '이어할 저장 게임이 없습니다'
+        return self._apply_loaded_game(record, message='저장된 게임을 이어갑니다')
+
+    def _maybe_restore_saved_game_once(self) -> None:
+        if self._saved_game_restored:
+            return
+        if not bool(self.get_parameter('restore_saved_game').value):
+            self._saved_game_restored = True
+            return
+        self._saved_game_restored = True
+        if hasattr(self, '_restore_timer'):
+            try:
+                self._restore_timer.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+        self._try_restore_saved_game()
 
     def shutdown(self) -> None:
         if self._twin_side_service is not None:
@@ -443,6 +563,20 @@ class WebBridgeNode(Node):
     def set_hand_auto_confirm_enabled(self, enabled: bool) -> None:
         self._hand_auto_confirm_runtime = bool(enabled)
 
+    def is_hand_safety_enabled(self) -> bool:
+        return self._hand_safety_runtime
+
+    def set_hand_safety_enabled(self, enabled: bool) -> None:
+        self._hand_safety_runtime = bool(enabled)
+        if not self._hand_safety_runtime:
+            # Immediately let the arm node know hand is clear so a pause already
+            # latched from before disabling doesn't stick around, and so it stops
+            # reacting to the hand topic going forward (_apply_hand_update also
+            # stops publishing True while this is off).
+            self._publish_hand_in_board(False, force=True)
+            if self._hand_safety_paused:
+                self._release_hand_safety_pause()
+
     def _get_hand_service(self) -> HandDetectorService:
         if self._hand_service is not None:
             return self._hand_service
@@ -458,6 +592,20 @@ class WebBridgeNode(Node):
             )
         )
         return self._hand_service
+
+    def _hand_blocks_robot(self) -> bool:
+        """True when side-view hand is in the board ROI (raw or debounced)."""
+        if not self._hand_safety_runtime:
+            return False
+        with self._hand_lock:
+            return self._hand_in_board or self._hand_raw_in_board
+
+    def _robot_hand_active(self, raw_in_board: bool, debounced_in_board: bool) -> bool:
+        """Arm must stay paused while either raw or debounced hand is in ROI."""
+        return raw_in_board or debounced_in_board
+
+    def _publish_robot_hand_state(self, raw_in_board: bool, debounced_in_board: bool) -> None:
+        self._publish_hand_in_board(self._robot_hand_active(raw_in_board, debounced_in_board))
 
     def _publish_hand_in_board(self, in_board: bool, *, force: bool = False) -> None:
         if not force and self._hand_last_published_in_board is in_board:
@@ -492,27 +640,30 @@ class WebBridgeNode(Node):
         )
 
     def _recover_stale_bot_activity(self) -> bool:
-        """Reset stuck bot UI/worker flags so the next bot move can start."""
-        stale_status = self.bot_status in ('thinking', 'moving', 'paused')
+        """Reset stuck bot UI/worker flags when the worker is gone — never abort in-flight motion."""
+        if self._active_move_goal_handle is not None:
+            return False
         with self._bot_lock:
             busy = self._bot_busy
             worker = self._bot_worker_thread
         worker_alive = worker is not None and worker.is_alive()
-        orphan_busy = busy and not worker_alive
-        timed_out = (
-            self._bot_activity_started_at > 0.0
-            and time.time() - self._bot_activity_started_at > 30.0
-        )
-        should_recover = orphan_busy or (stale_status and not worker_alive) or (
-            busy and timed_out
-        ) or (stale_status and timed_out)
-        if not should_recover:
+        if busy and worker_alive:
             return False
-        if busy and worker_alive and not timed_out and not stale_status:
+        stale_status = self.bot_status in ('thinking', 'moving', 'paused')
+        orphan_busy = busy and not worker_alive
+        stale_no_worker = stale_status and not worker_alive
+        ghost_paused = (
+            self.bot_status == 'paused'
+            and not self._hand_safety_paused
+            and not self._hand_blocks_robot()
+            and not worker_alive
+        )
+        if not orphan_busy and not stale_no_worker and not ghost_paused:
             return False
         self.get_logger().warn(
             f'recovering stale bot activity status={self.bot_status} busy={busy}'
         )
+        self._cancel_active_robot_goals()
         with self._bot_lock:
             self._bot_busy = False
             self._bot_pending_fen = ''
@@ -522,25 +673,216 @@ class WebBridgeNode(Node):
         self._ensure_hand_clear_for_robot()
         return True
 
-    def _update_hand_safety(self, hand_in_board: bool) -> None:
-        if not bool(self.get_parameter('hand_safety_enabled').value):
+    def _fen_fullmove_number(self, fen: str) -> int:
+        try:
+            return chess.Board((fen or '').strip()).fullmove_number
+        except ValueError:
+            return 0
+
+    def _fen_looks_regressed(self, new_fen: str) -> bool:
+        new_fen = (new_fen or '').strip()
+        if not new_fen or not self.latest_fen:
+            return False
+        if len(self.move_history) == 0 and self._ply_counter == 0:
+            return False
+        try:
+            cur = chess.Board(self.latest_fen)
+            new = chess.Board(new_fen)
+        except ValueError:
+            return False
+        if new.fullmove_number < cur.fullmove_number:
+            return True
+        if new_fen.split()[0] == START_FEN.split()[0] and cur.fullmove_number > 1:
+            return True
+        return False
+
+    def _bot_fen_trustworthy(self, fen: str) -> bool:
+        fen = (fen or '').strip()
+        if not fen:
+            return False
+        hist_len = len(self.move_history)
+        if hist_len == 0 and self._ply_counter == 0:
+            return True
+        try:
+            board = chess.Board(fen)
+        except ValueError:
+            return False
+        if fen.split()[0] == START_FEN.split()[0] and hist_len >= 2:
+            # #region agent log
+            agent_log(
+                'web_bridge.py:_bot_fen_trustworthy',
+                'REJECT start FEN with move history',
+                {'fen': fen, 'move_history_len': hist_len, 'ply': self._ply_counter},
+                hypothesis_id='A',
+            )
+            # #endregion
+            return False
+        expected_min_fullmove = max(1, (hist_len + 1) // 2)
+        if board.fullmove_number < expected_min_fullmove and hist_len >= 2:
+            # #region agent log
+            agent_log(
+                'web_bridge.py:_bot_fen_trustworthy',
+                'REJECT fen behind move history',
+                {
+                    'fen': fen,
+                    'fullmove': board.fullmove_number,
+                    'expected_min': expected_min_fullmove,
+                    'move_history_len': hist_len,
+                },
+                hypothesis_id='A',
+            )
+            # #endregion
+            return False
+        return True
+
+    def _bot_motion_active(self) -> bool:
+        with self._bot_lock:
+            busy = self._bot_busy
+            worker = self._bot_worker_thread
+        return busy and worker is not None and worker.is_alive()
+
+    def _enforce_human_turn_arm_safety(self) -> bool:
+        """Stop/cancel any in-flight arm motion during the human turn."""
+        if not self._bot_session_active or self.game_phase != 'playing':
+            return False
+        if not self._is_human_turn(self.latest_white_to_move):
+            return False
+        with self._bot_lock:
+            worker = self._bot_worker_thread
+        worker_alive = worker is not None and worker.is_alive()
+        arm_busy = (
+            worker_alive
+            or self.bot_status in ('thinking', 'moving', 'paused')
+            or self._active_move_goal_handle is not None
+        )
+        if not arm_busy:
+            return False
+        if self._active_move_goal_handle is not None:
+            # #region agent log
+            agent_log(
+                'web_bridge.py:_enforce_human_turn_arm_safety',
+                'SKIP enforce — execute_move goal in flight',
+                {
+                    'fen': self.latest_fen,
+                    'bot_status': self.bot_status,
+                    'white_to_move': self.latest_white_to_move,
+                },
+                hypothesis_id='E',
+            )
+            # #endregion
+            return False
+        if worker_alive:
+            # Physical goal finished; worker is syncing FEN/history — do not user_stop.
+            if self.bot_status in ('thinking', 'moving', 'paused'):
+                self.bot_status = 'idle'
+            self._hand_safety_paused = False
+            # #region agent log
+            agent_log(
+                'web_bridge.py:_enforce_human_turn_arm_safety',
+                'SKIP enforce — worker post-move sync',
+                {
+                    'fen': self.latest_fen,
+                    'bot_status': self.bot_status,
+                    'white_to_move': self.latest_white_to_move,
+                },
+                hypothesis_id='E',
+            )
+            # #endregion
+            return False
+        # #region agent log
+        agent_log(
+            'web_bridge.py:_enforce_human_turn_arm_safety',
+            'STOP human turn arm',
+            {
+                'fen': self.latest_fen,
+                'human_color': self._human_color(),
+                'white_to_move': self.latest_white_to_move,
+                'bot_status': self.bot_status,
+                'worker_alive': worker_alive,
+                'active_goal': self._active_move_goal_handle is not None,
+            },
+            hypothesis_id='E',
+        )
+        # #endregion
+        self.get_logger().warn(
+            'human turn — stopping robot arm (motion blocked during player turn)'
+        )
+        self._bot_cancel_requested = True
+        self._cancel_active_robot_goals()
+        self._call_trigger_service(self.robot_user_stop_client, timeout_sec=3.0)
+        with self._bot_lock:
+            self._bot_busy = False
+            self._bot_pending_fen = ''
+        self._bot_cancel_requested = False
+        self.bot_status = 'idle'
+        self._hand_safety_paused = False
+        self._publish_hand_in_board(False, force=True)
+        return True
+
+    def _resolve_bot_status_after_hand_release(self) -> None:
+        """Restore bot UI state after hand safety pause — never block human on stale 'moving'."""
+        if self._active_move_goal_handle is not None:
+            self.bot_status = 'moving'
             return
-        robot_active = self.bot_status in ('moving', 'paused') or self._restore_in_progress
-        if hand_in_board and robot_active and not self._hand_safety_paused:
+        if not self._bot_motion_active():
+            self.bot_status = 'idle'
+            return
+        if self._is_human_turn(self.latest_white_to_move):
+            self.bot_status = 'idle'
+            return
+        restore = self._bot_status_before_pause
+        self.bot_status = restore if restore in ('thinking', 'moving') else 'idle'
+
+    def _release_hand_safety_pause(self) -> None:
+        if self._hand_blocks_robot():
+            return
+        was_paused = self._hand_safety_paused
+        self._hand_safety_paused = False
+        if was_paused or self.bot_status == 'paused':
+            self._resolve_bot_status_after_hand_release()
+        self._publish_hand_in_board(False, force=True)
+        self._ensure_hand_clear_for_robot()
+        if was_paused:
+            self.get_logger().info('hand cleared — robot safety pause released')
+        # #region agent log
+        agent_log(
+            'web_bridge.py:_release_hand_safety_pause',
+            'hand pause released',
+            {
+                'was_paused': was_paused,
+                'bot_status': self.bot_status,
+                'bot_motion_active': self._bot_motion_active(),
+                'hand_raw': self._hand_raw_in_board,
+                'hand_debounced': self._hand_in_board,
+                'white_to_move': self.latest_white_to_move,
+                'human_color': self._human_color(),
+            },
+            hypothesis_id='C',
+        )
+        # #endregion
+        self._try_process_pending_vision_auto_move()
+        self._maybe_resume_bot_after_player_move()
+
+    def _update_hand_safety(self, raw_in_board: bool, debounced_in_board: bool) -> None:
+        if not self._hand_safety_runtime:
+            return
+        if self._is_human_turn(self.latest_white_to_move):
+            self._enforce_human_turn_arm_safety()
+            return
+        hand_blocks = self._robot_hand_active(raw_in_board, debounced_in_board)
+        robot_active = (
+            self.bot_status in ('thinking', 'moving', 'paused')
+            or self._restore_in_progress
+            or self._bot_busy
+        )
+        if hand_blocks and robot_active and not self._hand_safety_paused:
             self._hand_safety_paused = True
             if self.bot_status != 'paused':
                 self._bot_status_before_pause = self.bot_status
             self.bot_status = 'paused'
             self.get_logger().info('hand on board — robot paused for safety')
-        elif not hand_in_board and self._hand_safety_paused:
-            self._hand_safety_paused = False
-            if self._restore_in_progress or self._bot_busy:
-                self.bot_status = 'moving'
-            else:
-                self.bot_status = self._bot_status_before_pause or 'idle'
-            self.get_logger().info('hand cleared — robot safety pause released')
-            self._try_process_pending_vision_auto_move()
-            self._maybe_resume_bot_after_player_move()
+        elif not hand_blocks and self._hand_safety_paused:
+            self._release_hand_safety_pause()
 
     def _schedule_hand_auto_confirm(self) -> None:
         if not self._hand_auto_confirm_runtime:
@@ -590,6 +932,23 @@ class WebBridgeNode(Node):
 
         def _run() -> None:
             try:
+                if not self._is_human_turn(self.latest_white_to_move):
+                    agent_log(
+                        'web_bridge.py:_execute_hand_auto_confirm',
+                        'skipped robot turn',
+                        {'fen': self.latest_fen},
+                        hypothesis_id='C',
+                    )
+                    return
+                if self._recent_player_move_applied():
+                    agent_log(
+                        'web_bridge.py:_execute_hand_auto_confirm',
+                        'skipped duplicate confirm after auto move',
+                        {'uci': self._last_auto_move_uci},
+                        hypothesis_id='C',
+                    )
+                    self._maybe_resume_bot_after_player_move()
+                    return
                 success, message, from_sq, to_sq = self.confirm_player_move()
                 self.get_logger().info(
                     f'hand auto confirm: success={success} {from_sq}->{to_sq} msg={message}'
@@ -679,7 +1038,6 @@ class WebBridgeNode(Node):
         raw_in_board = any(det.in_board_roi for det in update.detections)
         self._store_hand_preview(service, frame, update)
         with self._hand_lock:
-            prev_in_board = self._hand_in_board
             self._hand_in_board = update.hand_in_board
             self._hand_raw_in_board = raw_in_board
             self._hand_seen = update.hand_seen
@@ -693,14 +1051,18 @@ class WebBridgeNode(Node):
                 self._hand_left_at = time.time()
                 self._schedule_hand_auto_confirm()
             self._hand_leave_event(raw_in_board=raw_in_board)
-            if prev_in_board != self._hand_in_board:
-                self._publish_hand_in_board(self._hand_in_board)
-            elif not raw_in_board and not update.hand_in_board:
-                self._republish_hand_clear_if_robot_active(
-                    in_board=self._hand_in_board,
-                    raw_in_board=raw_in_board,
-                )
-        self._update_hand_safety(update.hand_in_board)
+            if raw_in_board:
+                self._hand_raw_streak += 1
+            else:
+                self._hand_raw_streak = 0
+            raw_confirmed = self._hand_raw_streak >= self._hand_raw_confirm_frames
+            robot_hand = (
+                self._robot_hand_active(raw_confirmed, update.hand_in_board)
+                if self._hand_safety_runtime
+                else False
+            )
+            self._publish_hand_in_board(robot_hand)
+        self._update_hand_safety(raw_in_board, update.hand_in_board)
         self._maybe_run_hand_auto_confirm()
 
     def _refresh_hand_preview_from_frame(self, frame: np.ndarray) -> None:
@@ -732,6 +1094,7 @@ class WebBridgeNode(Node):
         self.get_logger().warn(f'hand capture failed: {err}', throttle_duration_sec=5.0)
 
     def _timer_game_flow_poll(self) -> None:
+        self._enforce_human_turn_arm_safety()
         self._try_process_pending_vision_auto_move()
         self._maybe_resume_bot_after_player_move()
 
@@ -1058,6 +1421,7 @@ class WebBridgeNode(Node):
             'hand_present': hand_present if hand_available else False,
             'hand_safety_paused': hand_safety_paused if hand_available else False,
             'hand_auto_confirm_enabled': self._hand_auto_confirm_runtime,
+            'hand_safety_enabled': self._hand_safety_runtime,
             'hand_preview_available': hand_preview_available if hand_available else False,
             'hand_preview_error': hand_preview_error if hand_available else '',
             'hand_detection_count': hand_detection_count if hand_available else 0,
@@ -1193,6 +1557,15 @@ class WebBridgeNode(Node):
             return False
         human_is_white = self._human_color() == 'white'
         return piece.color == chess.WHITE if human_is_white else piece.color == chess.BLACK
+
+    def _uci_is_robot_move(self, fen: str, uci: str) -> bool:
+        uci = (uci or '').strip().lower()
+        if len(uci) < 4:
+            return False
+        legal = resolve_legal_uci_full(uci, fen)
+        if legal is None:
+            return False
+        return not self._uci_is_human_move(fen, legal)
 
     @staticmethod
     def _is_illegal_move_result(result, *, legal: bool, uci: str) -> bool:
@@ -1354,7 +1727,7 @@ class WebBridgeNode(Node):
                 Parameter('difficulty', Parameter.Type.STRING, record.difficulty),
                 Parameter('board_orientation', Parameter.Type.STRING, orientation),
             ])
-            self._engine.configure_opponent(record.difficulty)  # type: ignore[arg-type]
+            self._with_engine(lambda: self._engine.configure_opponent(record.difficulty))  # type: ignore[arg-type]
 
     def _refresh_game_phase(self, fen: str) -> None:
         outcome = game_outcome(chess.Board(fen))
@@ -1388,36 +1761,52 @@ class WebBridgeNode(Node):
         return True, result.message
 
     def _try_restore_saved_game(self) -> None:
-        if hasattr(self, '_restore_timer'):
-            self._restore_timer.cancel()
+        if (
+            self.game_phase == 'playing'
+            and (self.move_history or self._ply_counter > 0)
+        ):
+            # #region agent log
+            agent_log(
+                'web_bridge.py:_try_restore_saved_game',
+                'SKIP restore — game already in progress',
+                {
+                    'fen': self.latest_fen,
+                    'move_history_len': len(self.move_history),
+                    'ply': self._ply_counter,
+                },
+                hypothesis_id='A',
+            )
+            # #endregion
+            self.get_logger().info('Skip saved-game restore: game already in progress')
+            return
         record = self._game_store.load_active_game()
         if record is None:
             self.get_logger().info('No saved game to restore')
             return
         if record.game_phase == 'lobby':
             return
+        if self.latest_fen and record.fen:
+            try:
+                if self._fen_fullmove_number(self.latest_fen) > self._fen_fullmove_number(
+                    record.fen
+                ):
+                    # #region agent log
+                    agent_log(
+                        'web_bridge.py:_try_restore_saved_game',
+                        'SKIP restore — current fen ahead of saved',
+                        {'current_fen': self.latest_fen, 'saved_fen': record.fen},
+                        hypothesis_id='A',
+                    )
+                    # #endregion
+                    return
+            except ValueError:
+                pass
 
         self.get_logger().info(
             f'Restoring saved game {record.id[:8]}… fen={record.fen.split()[0]} '
             f'moves={len(record.move_history)}'
         )
-        self._apply_game_record(record)
-        with self._bot_lock:
-            self._bot_busy = False
-            self._bot_pending_fen = ''
-
-        logical_ok, logical_msg = self._sync_logical_board(record.fen)
-        if not logical_ok:
-            self.get_logger().warn(f'vision restore failed: {logical_msg}')
-        sync_ok, sync_msg = self._sync_robot_board(record.fen)
-        if not sync_ok:
-            self.get_logger().warn(f'robot restore failed: {sync_msg}')
-        self._refresh_game_phase(record.fen)
-        self.latest_message = '저장된 게임을 복원했습니다'
-        self._spin_for_updates()
-        self._persist_game_state()
-        self._bot_session_active = False
-        # Do not auto-play on restore; wait until reset_board starts a session.
+        self._apply_loaded_game(record, message='저장된 게임을 복원했습니다')
 
     def set_game_config(
         self,
@@ -1447,7 +1836,7 @@ class WebBridgeNode(Node):
                     'difficulty must be beginner, easy, medium, hard, or master'
                 )
             params.append(Parameter('difficulty', Parameter.Type.STRING, level))
-            self._engine.configure_opponent(level)  # type: ignore[arg-type]
+            self._with_engine(lambda: self._engine.configure_opponent(level))  # type: ignore[arg-type]
         if board_orientation is not None:
             orientation = board_orientation.strip().lower()
             if orientation not in {'standard', 'flipped'}:
@@ -1461,6 +1850,14 @@ class WebBridgeNode(Node):
             f'difficulty={self._difficulty()}, orientation={self._board_orientation()}'
         )
 
+    def _recent_player_move_applied(self) -> bool:
+        cooldown = float(self.get_parameter('hand_confirm_cooldown_sec').value)
+        with self._auto_move_lock:
+            return (
+                bool(self._last_auto_move_uci)
+                and time.time() - self._last_auto_move_at < cooldown
+            )
+
     def _on_snapshot(self, msg: GameSnapshot) -> None:
         game_id = (msg.game_id or '').strip()
         if game_id.startswith('auto_move:'):
@@ -1470,6 +1867,29 @@ class WebBridgeNode(Node):
                 if self._is_human_turn(self.latest_white_to_move):
                     fen_before_hint = (self.latest_fen or '').strip()
             if uci and msg.fen:
+                if fen_before_hint:
+                    try:
+                        human_turn = self._is_human_turn(
+                            chess.Board(fen_before_hint).turn == chess.WHITE
+                        )
+                    except ValueError:
+                        human_turn = False
+                else:
+                    human_turn = self._is_human_turn(self.latest_white_to_move)
+                if not human_turn:
+                    agent_log(
+                        'web_bridge.py:_on_snapshot',
+                        'auto_move snapshot ignored (robot turn)',
+                        {'uci': uci, 'fen_before_hint': fen_before_hint, 'fen_after': msg.fen},
+                        hypothesis_id='B',
+                    )
+                    return
+                agent_log(
+                    'web_bridge.py:_on_snapshot',
+                    'auto_move snapshot scheduled',
+                    {'uci': uci, 'fen_before_hint': fen_before_hint, 'fen_after': msg.fen},
+                    hypothesis_id='B',
+                )
                 self._schedule_vision_auto_move(
                     uci,
                     msg.fen,
@@ -1478,9 +1898,28 @@ class WebBridgeNode(Node):
             return
 
         if msg.fen:
-            self.latest_fen = msg.fen
-        self.latest_white_to_move = bool(msg.white_to_move)
-        self.latest_move_number = int(msg.move_number)
+            if self._fen_looks_regressed(msg.fen):
+                # #region agent log
+                agent_log(
+                    'web_bridge.py:_on_snapshot',
+                    'IGNORE snapshot fen regression',
+                    {
+                        'incoming_fen': msg.fen,
+                        'latest_fen': self.latest_fen,
+                        'game_id': game_id,
+                        'move_history_len': len(self.move_history),
+                    },
+                    hypothesis_id='A',
+                )
+                # #endregion
+            else:
+                self.latest_fen = msg.fen
+                self.latest_white_to_move = bool(msg.white_to_move)
+                self.latest_move_number = int(msg.move_number)
+        elif msg.white_to_move is not None:
+            self.latest_white_to_move = bool(msg.white_to_move)
+            self.latest_move_number = int(msg.move_number)
+        self._enforce_human_turn_arm_safety()
 
     def _uci_promo_variants(self, uci: str) -> list[str]:
         uci = (uci or '').strip().lower()
@@ -1599,7 +2038,7 @@ class WebBridgeNode(Node):
         return None
 
     def _vision_auto_move_ready(self) -> bool:
-        if self._board_reset_in_progress or not self._active_game_id:
+        if self._board_reset_in_progress or self._restore_in_progress or not self._active_game_id:
             return False
         if self.game_phase != 'playing':
             return False
@@ -1679,11 +2118,16 @@ class WebBridgeNode(Node):
         if self.game_phase != 'playing' or not self._auto_bot_move():
             return
         self._recover_stale_bot_activity()
-        if self._bot_busy or self.bot_status in ('thinking', 'moving', 'paused'):
+        if self._bot_busy or self.bot_status in ('thinking', 'moving', 'paused', 'error'):
             return
         if self._hand_safety_paused:
             return
+        with self._hand_lock:
+            if self._hand_in_board or self._hand_raw_in_board:
+                return
         if not self._is_robot_turn(self.latest_white_to_move):
+            return
+        if not self._bot_fen_trustworthy(self.latest_fen):
             return
         with self._auto_move_lock:
             if self._pending_vision_auto_move is not None:
@@ -1714,25 +2158,25 @@ class WebBridgeNode(Node):
         )
         if not fen_before:
             self.get_logger().warn(f'vision auto move: cannot infer fen_before for {uci}')
-            try:
-                after_board = chess.Board(fen_after)
-            except ValueError:
-                return False
-            if self._is_robot_turn(after_board.turn == chess.WHITE):
-                self._sync_from_fen(fen_after)
-                from_sq, to_sq = uci[:2], uci[2:4] if len(uci) >= 4 else ('', '')
-                if from_sq and to_sq:
-                    self.latest_from = from_sq
-                    self.latest_to = to_sq
-                self.latest_message = f'수 인지됨 (fallback): {from_sq} → {to_sq}'
-                self._spin_for_updates(3)
-                self._update_game_over_state(fen_after)
-                self.is_check = after_board.is_check()
-                if self.game_phase != 'finished':
-                    self._recover_stale_bot_activity()
-                    self._maybe_play_bot_move(fen_after)
-                self._persist_game_state()
-                return True
+            agent_log(
+                'web_bridge.py:_handle_vision_auto_move',
+                'fen_before inference failed',
+                {'uci': uci, 'fen_after': fen_after, 'fen_before_hint': fen_before_hint},
+                hypothesis_id='B',
+            )
+            return False
+        try:
+            human_turn = self._is_human_turn(chess.Board(fen_before).turn == chess.WHITE)
+        except ValueError:
+            human_turn = False
+        if not human_turn:
+            self.get_logger().warn(f'vision auto move: not human turn for {uci}')
+            agent_log(
+                'web_bridge.py:_handle_vision_auto_move',
+                'rejected robot turn',
+                {'uci': uci, 'fen_before': fen_before},
+                hypothesis_id='B',
+            )
             return False
         legal = resolve_legal_uci_full(uci, fen_before)
         if legal is None:
@@ -1740,7 +2184,25 @@ class WebBridgeNode(Node):
             return False
         if not self._uci_is_human_move(fen_before, legal):
             self.get_logger().warn(f'vision auto move: not human piece {uci}')
+            agent_log(
+                'web_bridge.py:_handle_vision_auto_move',
+                'not human piece',
+                {
+                    'uci': uci,
+                    'legal': legal,
+                    'fen_before': fen_before,
+                    'human_color': self._human_color(),
+                },
+                hypothesis_id='B',
+            )
             return False
+
+        agent_log(
+            'web_bridge.py:_handle_vision_auto_move',
+            'applying auto move',
+            {'uci': legal, 'fen_before': fen_before, 'fen_after': fen_after},
+            hypothesis_id='B',
+        )
 
         from_sq, to_sq = legal[:2], legal[2:4]
         self.get_logger().info(f'vision auto move: {from_sq}->{to_sq} ({legal})')
@@ -1783,8 +2245,15 @@ class WebBridgeNode(Node):
         self._persist_game_state()
         return True
 
-    def _maybe_play_bot_move(self, fen: str) -> None:
+    def _maybe_play_bot_move(self, fen: str, *, trust_fen: bool = False) -> None:
         if not self._bot_session_active:
+            return
+        if not trust_fen and not self._bot_fen_trustworthy(fen):
+            return
+        parts = fen.split()
+        white_to_move = len(parts) > 1 and parts[1] == 'w'
+        if self._is_human_turn(white_to_move):
+            self._enforce_human_turn_arm_safety()
             return
         self._recover_stale_bot_activity()
         if self.game_phase == 'finished':
@@ -1802,7 +2271,10 @@ class WebBridgeNode(Node):
                 f'bot move skipped: not robot turn (white_to_move={white_to_move})'
             )
             return
-        if self.bot_status in ('thinking', 'moving', 'paused') or self._hand_safety_paused:
+        if self._hand_blocks_robot():
+            self.get_logger().info('bot move skipped: hand on board')
+            return
+        if self.bot_status in ('thinking', 'moving', 'paused', 'error') or self._hand_safety_paused:
             self.get_logger().info('bot move skipped: bot active or safety paused')
             return
         with self._bot_lock:
@@ -1814,6 +2286,21 @@ class WebBridgeNode(Node):
                 return
             self._bot_busy = True
             self._bot_pending_fen = fen
+        # #region agent log
+        agent_log(
+            'web_bridge.py:_maybe_play_bot_move',
+            'START bot worker',
+            {
+                'fen': fen,
+                'latest_fen': self.latest_fen,
+                'human_color': self._human_color(),
+                'white_to_move_param': white_to_move,
+                'latest_white_to_move': self.latest_white_to_move,
+                'bot_status': self.bot_status,
+            },
+            hypothesis_id='A',
+        )
+        # #endregion
 
         def worker() -> None:
             try:
@@ -1836,6 +2323,14 @@ class WebBridgeNode(Node):
     def _run_bot_move(self, fen: str) -> None:
         if self._bot_cancel_requested:
             return
+        # Defense in depth: _maybe_play_bot_move already checks game_phase/
+        # _bot_session_active before spawning this worker thread, but re-check
+        # here too — a worker that was already past that check when the game
+        # ended (resign, etc.) must not go on to think/move for a game that's
+        # already over.
+        if self.game_phase == 'finished' or not self._bot_session_active:
+            self.bot_status = 'idle'
+            return
         try:
             self._bot_activity_started_at = time.time()
             self.bot_status = 'thinking'
@@ -1852,11 +2347,46 @@ class WebBridgeNode(Node):
                 self.get_logger().error('robot/execute_move action server unavailable')
                 return
 
-            self._engine.configure_opponent(self._difficulty())
-            uci = self._with_engine(lambda: self._engine.choose_move(fen))
+            active_fen = (self.latest_fen or fen).strip()
+            parts = active_fen.split()
+            white_to_move = len(parts) > 1 and parts[1] == 'w'
+            if not self._is_robot_turn(white_to_move):
+                self.get_logger().warn('bot move aborted: not robot turn')
+                self.bot_status = 'idle'
+                return
+            fen = active_fen
+
+            def _configure_and_choose() -> str:
+                self._engine.configure_opponent(self._difficulty())
+                return self._engine.choose_move(fen)
+
+            # configure + choose must be one locked call: configure_opponent() sends
+            # UCI setoption commands on the same subprocess pipe as choose_move()'s
+            # position/go commands. Running them as two separate lock acquisitions
+            # (or worse, unlocked) let another thread's evaluate()/classify_move()
+            # call interleave mid-protocol, corrupting the engine and permanently
+            # breaking it (falls back to legal_moves[0] forever afterward — the bot
+            # then always develops the same piece and shuffles, regardless of
+            # difficulty).
+            uci = self._with_engine(_configure_and_choose)
             if uci is None or self._bot_cancel_requested:
                 self.bot_status = 'idle'
                 return
+            if not self._uci_is_robot_move(fen, uci):
+                self.get_logger().error(f'bot move aborted: not robot piece {uci}')
+                self.bot_status = 'error'
+                self.latest_message = f'로봇 기물이 아닌 수: {uci}'
+                return
+            if self._hand_blocks_robot():
+                self.get_logger().warn('bot move deferred: hand on board')
+                self.bot_status = 'idle'
+                return
+            parts = (self.latest_fen or fen).split()
+            if len(parts) > 1 and not self._is_robot_turn(parts[1] == 'w'):
+                self.get_logger().warn('bot move aborted: turn changed before arm move')
+                self.bot_status = 'idle'
+                return
+            fen = (self.latest_fen or fen).strip()
             from_sq, to_sq = uci[:2], uci[2:4]
             self.get_logger().info(f'Bot move planned: {uci} (fen={fen})')
 
@@ -1870,15 +2400,48 @@ class WebBridgeNode(Node):
                 if '보드 UI 반영됨' not in self.latest_message:
                     self.latest_message = f'로봇 수 실패: {message}'
                 self.get_logger().error(f'Bot move failed: {message}')
+                self._recover_robot_sync_after_failure()
         except Exception as exc:  # noqa: BLE001
             self.bot_status = 'error'
             self.latest_message = f'로봇 수 오류: {exc}'
             self.get_logger().error(f'Bot move error: {exc}')
+            self._recover_robot_sync_after_failure()
         finally:
             self._bot_activity_started_at = 0.0
             with self._bot_lock:
                 self._bot_busy = False
                 self._bot_pending_fen = ''
+
+    def _recover_robot_sync_after_failure(self) -> None:
+        """Re-push the current (un-advanced) FEN + graveyard slots to pick_place_node
+        after a failed bot move.
+
+        A move that fails partway (e.g. a capture interrupted mid pick-place, or
+        the arm rejected/aborted while carrying a piece) can leave pick_place_node's
+        internal board/graveyard bookkeeping out of sync with reality, so every
+        subsequent move keeps failing the same way. Manually using "보드 수정" and
+        saving always fixed this because correct_board() re-syncs robot state as a
+        side effect — do that same resync automatically instead of requiring the
+        user to intervene by hand every time.
+
+        Rate-limited: _sync_robot_board's CLI-first path spawns a whole new
+        `ros2 service call` subprocess. If bot moves keep failing back-to-back
+        (the exact scenario this exists for), calling it on every single failure
+        can pile up overlapping subprocess/service calls against the same
+        /robot/set_board service and starve out unrelated callers (e.g. the
+        board-restore button's own pre-restore sync) instead of helping.
+        """
+        cooldown = 3.0
+        now = time.time()
+        if now - self._last_recovery_sync_at < cooldown:
+            return
+        self._last_recovery_sync_at = now
+        try:
+            sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+            if not sync_ok:
+                self.get_logger().warn(f'post-failure robot resync failed: {sync_msg}')
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'post-failure robot resync raised: {exc}')
 
     def _apply_board_state_msg(self, board_state: BoardState) -> None:
         if board_state.occupancy.cells:
@@ -1892,6 +2455,7 @@ class WebBridgeNode(Node):
         parts = fen.split()
         if len(parts) >= 2:
             self.latest_white_to_move = parts[1] == 'w'
+        self._enforce_human_turn_arm_safety()
 
     def _sync_from_apply_result(self, apply_result) -> None:
         if getattr(apply_result, 'fen', ''):
@@ -2049,6 +2613,7 @@ class WebBridgeNode(Node):
             self.get_logger().warn(f'failed to record capture for {uci}: {exc}')
 
     def get_board_payload(self) -> dict[str, Any]:
+        self._maybe_restore_saved_game_once()
         payload: dict[str, Any] = {
             'fen': self.latest_fen,
             'occupancy': self.latest_occupancy,
@@ -2058,6 +2623,7 @@ class WebBridgeNode(Node):
             'robot_color': self._robot_color(),
             'board_orientation': self._board_orientation(),
             'bot_status': self.bot_status,
+            'user_stop_pending': self._user_stop_pending,
             'last_bot_move': self.last_bot_move,
             'auto_bot_move': self._auto_bot_move(),
             'human_captures': list(self.human_captures),
@@ -2088,6 +2654,7 @@ class WebBridgeNode(Node):
         payload['twin_runtime_enabled'] = self.is_twin_runtime_enabled()
         payload['hand_available'] = self._hand_enabled()
         payload['hand_auto_confirm_enabled'] = self._hand_auto_confirm_runtime
+        payload['hand_safety_enabled'] = self._hand_safety_runtime
         return payload
 
     def attach_executor(self, executor: MultiThreadedExecutor) -> None:
@@ -2165,6 +2732,7 @@ class WebBridgeNode(Node):
             self._hand_seen = False
             self._hand_present = False
             self._hand_raw_in_board_prev = False
+            self._hand_raw_streak = 0
             self._hand_safety_paused = False
             self._hand_left_at = 0.0
             self._hand_confirm_pending = False
@@ -2191,20 +2759,18 @@ class WebBridgeNode(Node):
     def _prepare_robot_for_reset(self) -> None:
         """Clear hand pause / in-flight arm goals so reset_board can finish quickly."""
         self._bot_cancel_requested = True
-        self._recover_stale_bot_activity()
+        self._cancel_active_robot_goals()
         with self._bot_lock:
             self._bot_pending_fen = ''
-            self._bot_busy = False
         worker = self._bot_worker_thread
         if worker is not None and worker.is_alive() and worker is not threading.current_thread():
-            worker.join(timeout=3.0)
+            worker.join(timeout=12.0)
+        with self._bot_lock:
+            self._bot_busy = False
         self._bot_worker_thread = None
         self._bot_cancel_requested = False
         self.bot_status = 'idle'
         self._hand_safety_paused = False
-        self._publish_hand_in_board(False, force=True)
-        self._cancel_active_robot_goals()
-        time.sleep(0.2)
         self._publish_hand_in_board(False, force=True)
 
     def reset_board(self) -> tuple[bool, str]:
@@ -2245,6 +2811,12 @@ class WebBridgeNode(Node):
             self.get_logger().warn(
                 f'reset_board: robot reset failed — continuing with vision scan: {robot_msg}'
             )
+        # reset_board's own service call reports success=True even when the physical
+        # arm failed to home (that's a separate, non-fatal failure from the board's
+        # logical reset) — the detail only lives in robot_msg, so it must be carried
+        # through to whatever message is ultimately returned below, or the UI just
+        # shows a plain "board reset" success with no hint the arm never moved.
+        home_warning = robot_msg if '로봇 홈 복귀 실패' in robot_msg else ''
         if not self._vision_mode():
             self._sync_from_fen(START_FEN)
             record = self._game_store.create_new_game(
@@ -2258,6 +2830,9 @@ class WebBridgeNode(Node):
             self._persist_game_state()
             self._bot_session_active = True
             self._maybe_play_bot_move(self.latest_fen)
+            if home_warning:
+                self.latest_message = home_warning
+                return True, f'{message} ({home_warning})'
             return True, message
 
         scan_ok, scan_msg = self._run_scan_initial()
@@ -2287,14 +2862,34 @@ class WebBridgeNode(Node):
         if not sync_ok:
             self.get_logger().warn(f'reset_board: robot sync failed (non-fatal): {sync_msg}')
         self.get_logger().info('reset_board: complete')
+        if home_warning:
+            self.latest_message = home_warning
+            return scan_ok, f'{scan_msg} ({home_warning})'
         return scan_ok, scan_msg
 
     def restore_board_physical(self) -> tuple[bool, str]:
+        agent_log(
+            'web_bridge.py:restore_board_physical',
+            'restore requested',
+            {
+                'latest_fen': self.latest_fen,
+                'graveyard_slots': self.graveyard_slots,
+                'human_graveyard_slots': self.human_graveyard_slots,
+                'game_phase': self.game_phase,
+            },
+            hypothesis_id='G',
+        )
         if not self.restore_action_client.wait_for_server(timeout_sec=5.0):
             return False, 'restore_board action unavailable'
 
         if self.latest_fen.strip():
             sync_ok, sync_msg = self._sync_robot_board(self.latest_fen)
+            agent_log(
+                'web_bridge.py:restore_board_physical',
+                'robot board sync before restore',
+                {'sync_ok': sync_ok, 'sync_msg': sync_msg},
+                hypothesis_id='G',
+            )
             if not sync_ok:
                 return False, sync_msg
 
@@ -2345,11 +2940,20 @@ class WebBridgeNode(Node):
     def resign_game(self) -> tuple[bool, str]:
         if self.game_phase == 'finished':
             return False, '게임이 이미 종료되었습니다'
+        # Stop any in-flight/queued bot activity immediately — without this, a
+        # bot-move worker thread already past its game_phase check (e.g. spawned
+        # right as resign happens) or a vision "move" misdetected from unrelated
+        # board activity (like a board restore) could still go on to make a move
+        # after the game was declared over.
+        self._bot_session_active = False
+        self._bot_cancel_requested = True
+        self._cancel_active_robot_goals()
         if self.bot_status in ('thinking', 'moving'):
             with self._bot_lock:
                 self._bot_pending_fen = ''
                 self._bot_busy = False
             self.bot_status = 'idle'
+        self._bot_cancel_requested = False
         self.game_phase = 'finished'
         self.game_result = 'resign'
         self.winner = 'robot'
@@ -2375,7 +2979,12 @@ class WebBridgeNode(Node):
             timeout_sec=12.0,
         )
         if ok:
-            return True, 'board reset'
+            # Don't discard the response — a homing failure (e.g. arm rejected by
+            # the DSR controller, timed out) is reported in the service message,
+            # not just as a ROS log line. Surface it instead of always showing a
+            # blanket "board reset" success with no hint the arm never moved home.
+            msg_match = re.search(r"message='([^']*)'", msg)
+            return True, msg_match.group(1) if msg_match else 'board reset'
         self.get_logger().warn(f'reset_board cli failed ({msg}); trying rclpy')
         result, err = self._call_service(
             self.reset_client,
@@ -2519,6 +3128,19 @@ class WebBridgeNode(Node):
         legal = bool(uci) and self._is_legal_uci(fen_before, uci)
         human_move = bool(uci) and self._uci_is_human_move(fen_before, uci)
         success = bool(result.success) and legal and human_move
+        agent_log(
+            'web_bridge.py:confirm_player_move',
+            'confirm result',
+            {
+                'success': success,
+                'legal': legal,
+                'human_move': human_move,
+                'uci': uci,
+                'fen_before': fen_before,
+                'message': result.message,
+            },
+            hypothesis_id='C',
+        )
         bot_fen = ''
 
         if self._is_illegal_move_result(result, legal=legal, uci=uci):
@@ -2619,9 +3241,11 @@ class WebBridgeNode(Node):
                 except ValueError:
                     robot_turn = False
             if (
-                self.game_phase != 'finished'
+                board_unchanged
+                and self.game_phase != 'finished'
                 and robot_turn
-                and (board_unchanged or result_fen)
+                and result_fen
+                and self._is_robot_turn(chess.Board(result_fen).turn == chess.WHITE)
             ):
                 if result_fen:
                     self._sync_from_fen(result_fen)
@@ -2706,8 +3330,14 @@ class WebBridgeNode(Node):
         fen_before = self.latest_fen
         if graveyard_slots is not None:
             self.graveyard_slots = list(graveyard_slots)
+            # The visible captured-pieces bar reads human_captures/robot_captures
+            # (plain symbol lists), not graveyard_slots (physical slot assignment) —
+            # without this, editing the graveyard grid saved fine but never showed
+            # up anywhere in the UI.
+            self.robot_captures = [s for s in self.graveyard_slots if s]
         if human_graveyard_slots is not None:
             self.human_graveyard_slots = list(human_graveyard_slots)
+            self.human_captures = [s for s in self.human_graveyard_slots if s]
         else:
             self.graveyard_slots, self.human_graveyard_slots = reconcile_graveyards_with_fen(
                 fen_before,
@@ -2724,6 +3354,13 @@ class WebBridgeNode(Node):
             board = chess.Board(fen_before)
             board.push_uci(inferred_uci)
             target_fen = board.fen()
+        else:
+            target_fen = guard_correction_fen(fen_before, fen)
+            if target_fen != fen:
+                self.get_logger().warn(
+                    f'correct_board: submitted FEN counters regressed '
+                    f'({fen!r} vs {fen_before!r}); keeping trusted move counters'
+                )
             try:
                 if graveyard_slots is None and human_graveyard_slots is None:
                     self._record_capture(fen_before, inferred_uci, by_robot=False)
@@ -2759,7 +3396,7 @@ class WebBridgeNode(Node):
         self._update_game_over_state(self.latest_fen)
         self.is_check = chess.Board(self.latest_fen).is_check()
         if self.game_phase != 'finished':
-            self._maybe_play_bot_move(self.latest_fen)
+            self._maybe_play_bot_move(self.latest_fen, trust_fen=True)
         self._spin_for_updates()
         self._persist_game_state()
         return True, self.latest_message
@@ -3001,7 +3638,91 @@ class WebBridgeNode(Node):
         self._spin_for_updates()
         return True, apply_result.message or legal, apply_result
 
-    def _execute_physical_move(self, uci: str, *, fen: str) -> tuple[bool, str]:
+    def _call_trigger_service(self, client, *, timeout_sec: float = 3.0) -> tuple[bool, str]:
+        request = Trigger.Request()
+        result, err = self._call_service(client, request, timeout_sec=timeout_sec)
+        if result is None:
+            return False, err or 'service unavailable'
+        if not result.success:
+            return False, result.message or 'request failed'
+        return True, result.message or 'ok'
+
+    def stop_robot_motion(self) -> tuple[bool, str]:
+        self._bot_cancel_requested = True
+        self._cancel_active_robot_goals()
+        ok, msg = self._call_trigger_service(self.robot_user_stop_client)
+        if not ok:
+            self.get_logger().warn(f'robot/user_stop failed: {msg}')
+        self._user_stop_pending = True
+        if self.bot_status not in ('stopped',):
+            self._bot_status_before_pause = self.bot_status
+        self.bot_status = 'stopped'
+        with self._bot_lock:
+            self._bot_busy = False
+            self._bot_pending_fen = ''
+        self.latest_message = '로봇 동작이 정지되었습니다'
+        self._persist_game_state()
+        return True, msg or 'stopped'
+
+    def resume_robot_motion(self) -> tuple[bool, str]:
+        ok, msg = self._call_trigger_service(self.robot_user_stop_resume_client)
+        if not ok:
+            return False, msg
+        self._user_stop_pending = False
+        self._bot_cancel_requested = False
+        self.bot_status = self._bot_status_before_pause or 'idle'
+        if self.bot_status == 'stopped':
+            self.bot_status = 'idle'
+        self.latest_message = '로봇 동작을 재개합니다'
+        if (
+            self._bot_session_active
+            and self.game_phase == 'playing'
+            and self._is_robot_turn(self.latest_white_to_move)
+        ):
+            self._maybe_play_bot_move(self.latest_fen)
+        self._persist_game_state()
+        return True, msg
+
+    def abort_robot_motion(self) -> tuple[bool, str]:
+        self._bot_cancel_requested = True
+        self._cancel_active_robot_goals()
+        ok, msg = self._call_trigger_service(self.robot_user_stop_abort_client, timeout_sec=20.0)
+        self._user_stop_pending = False
+        self._recover_stale_bot_activity()
+        self.bot_status = 'idle'
+        self.latest_message = '로봇 동작을 중단하고 홈으로 복귀했습니다'
+        self._persist_game_state()
+        return ok, msg or 'aborted'
+
+    def _execute_physical_move(self, uci: str, *, fen: str, for_voice: bool = False) -> tuple[bool, str]:
+        """Drive the arm through one physical move.
+
+        Used both for the bot's own automatic moves (default) and for voice
+        commands, where the human dictates their own move and the arm executes
+        it on their behalf. The turn/piece-color checks below assume a robot
+        move unless for_voice is set — a voice move happens *during the
+        human's turn* on a *human* piece by definition, so those same checks
+        would otherwise always reject it.
+        """
+        if not self._bot_session_active:
+            return False, 'bot session inactive'
+        if not for_voice and self._is_human_turn(self.latest_white_to_move):
+            self._enforce_human_turn_arm_safety()
+            return False, 'not robot turn'
+        if self._hand_blocks_robot():
+            return False, 'hand on board'
+        fen = (self.latest_fen or fen or '').strip()
+        parts = fen.split()
+        white_to_move = len(parts) > 1 and parts[1] == 'w'
+        if not for_voice and not self._is_robot_turn(white_to_move):
+            return False, 'not robot turn'
+        legal = resolve_legal_uci_full(uci, fen)
+        if legal:
+            if for_voice:
+                if not self._uci_is_human_move(fen, legal):
+                    return False, 'not human piece'
+            elif not self._uci_is_robot_move(fen, legal):
+                return False, 'not robot piece'
         if not self.action_client.wait_for_server(timeout_sec=5.0):
             return False, 'execute_move action unavailable'
 
@@ -3009,6 +3730,30 @@ class WebBridgeNode(Node):
         goal.move = ChessMove()
         self._fill_chess_move(goal.move, fen, uci)
 
+        if self._hand_blocks_robot():
+            return False, 'hand on board'
+        parts = (self.latest_fen or fen).split()
+        if not for_voice and len(parts) > 1 and not self._is_robot_turn(parts[1] == 'w'):
+            return False, 'not robot turn'
+        if self._active_move_goal_handle is not None:
+            return False, 'move already in progress'
+
+        # #region agent log
+        agent_log(
+            'web_bridge.py:_execute_physical_move',
+            'SEND execute_move goal',
+            {
+                'uci': uci,
+                'fen': fen,
+                'latest_fen': self.latest_fen,
+                'human_color': self._human_color(),
+                'white_to_move_fen': white_to_move,
+                'latest_white_to_move': self.latest_white_to_move,
+                'is_robot_piece': self._uci_is_robot_move(fen, legal or uci),
+            },
+            hypothesis_id='D',
+        )
+        # #endregion
         send_future = self.action_client.send_goal_async(goal)
         if not self._wait_future(send_future, 10.0) or send_future.result() is None:
             return False, 'failed to send goal'
@@ -3065,6 +3810,12 @@ class WebBridgeNode(Node):
         legal = resolve_legal_uci_full(uci, fen_before)
         if legal is None:
             return False, f'illegal bot move: {uci}'
+        parts = fen_before.split()
+        white_to_move = len(parts) > 1 and parts[1] == 'w'
+        if not self._is_robot_turn(white_to_move):
+            return False, 'not robot turn'
+        if not self._uci_is_robot_move(fen_before, legal):
+            return False, f'not robot piece: {legal}'
 
         sync_ok, sync_msg = self._sync_robot_board(fen_before)
         if not sync_ok:
@@ -3074,6 +3825,11 @@ class WebBridgeNode(Node):
         if not physical_ok:
             self.latest_message = f'로봇 이동 실패: {physical_msg}'
             return False, physical_msg
+
+        # Arm homed — release UI before logical sync so the human can play.
+        self.bot_status = 'idle'
+        self._hand_safety_paused = False
+        self._publish_hand_in_board(False, force=True)
 
         logical_synced = False
         if self._vision_mode():
@@ -3107,6 +3863,8 @@ class WebBridgeNode(Node):
 
     def execute_move(self, from_uci: str, to_uci: str) -> tuple[bool, str]:
         """Manual/debug move: physical first, then logical (legacy path)."""
+        if not self._is_robot_turn(self.latest_white_to_move):
+            return False, 'not robot turn'
         uci = f'{from_uci}{to_uci}'
         fen_before = self.latest_fen
         legal = resolve_legal_uci_full(uci, fen_before)
@@ -3328,7 +4086,7 @@ class WebBridgeNode(Node):
 
         self.bot_status = 'moving'
         self.latest_message = f'음성 명령 이동 중: {from_sq} → {to_sq}'
-        physical_ok, physical_msg = self._execute_physical_move(legal, fen=fen_before)
+        physical_ok, physical_msg = self._execute_physical_move(legal, fen=fen_before, for_voice=True)
         if not physical_ok:
             self.bot_status = 'error'
             base['message'] = physical_msg
@@ -3395,6 +4153,31 @@ def create_app(node: WebBridgeNode) -> FastAPI:
     @app.get('/api/board')
     def get_board() -> dict[str, Any]:
         return node.get_board_payload()
+
+    @app.get('/api/games')
+    def list_games() -> dict[str, Any]:
+        return {'games': node.list_saved_games()}
+
+    @app.post('/api/games/save')
+    def save_game() -> dict[str, Any]:
+        success, message = node.save_current_game()
+        if not success:
+            raise HTTPException(status_code=400, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
+
+    @app.post('/api/games/load')
+    def load_game(req: LoadGameRequest) -> dict[str, Any]:
+        success, message = node.load_saved_game(req.game_id)
+        if not success:
+            raise HTTPException(status_code=404, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
+
+    @app.post('/api/games/resume')
+    def resume_game() -> dict[str, Any]:
+        success, message = node.resume_active_saved_game()
+        if not success:
+            raise HTTPException(status_code=404, detail=message)
+        return {'success': success, 'message': message, **node.get_board_payload()}
 
     @app.post('/api/game/config')
     def set_game_config(req: GameConfigRequest) -> dict[str, Any]:
@@ -3495,10 +4278,14 @@ def create_app(node: WebBridgeNode) -> FastAPI:
     def hand_config(req: HandConfigRequest) -> dict[str, Any]:
         if not node._hand_enabled():
             raise HTTPException(status_code=400, detail='hand detection is not available in this launch')
-        node.set_hand_auto_confirm_enabled(req.auto_confirm_enabled)
+        if req.auto_confirm_enabled is not None:
+            node.set_hand_auto_confirm_enabled(req.auto_confirm_enabled)
+        if req.safety_enabled is not None:
+            node.set_hand_safety_enabled(req.safety_enabled)
         return {
             'success': True,
             'hand_auto_confirm_enabled': node.is_hand_auto_confirm_enabled(),
+            'hand_safety_enabled': node.is_hand_safety_enabled(),
             **node.get_board_payload(),
             **node.get_twin_live_payload(),
         }
@@ -3514,6 +4301,27 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             **node.get_twin_live_payload(),
             **node.get_board_payload(),
         }
+
+    @app.post('/api/robot/stop')
+    def robot_stop() -> dict[str, Any]:
+        ok, message = node.stop_robot_motion()
+        if not ok:
+            raise HTTPException(status_code=503, detail=message)
+        return {'success': ok, 'message': message, **node.get_board_payload()}
+
+    @app.post('/api/robot/stop/resume')
+    def robot_stop_resume() -> dict[str, Any]:
+        ok, message = node.resume_robot_motion()
+        if not ok:
+            raise HTTPException(status_code=503, detail=message)
+        return {'success': ok, 'message': message, **node.get_board_payload()}
+
+    @app.post('/api/robot/stop/abort')
+    def robot_stop_abort() -> dict[str, Any]:
+        ok, message = node.abort_robot_motion()
+        if not ok:
+            raise HTTPException(status_code=503, detail=message)
+        return {'success': ok, 'message': message, **node.get_board_payload()}
 
     @app.post('/api/voice-move')
     def voice_move(req: VoiceMoveRequest) -> dict[str, Any]:
@@ -3531,7 +4339,8 @@ def create_app(node: WebBridgeNode) -> FastAPI:
             raise HTTPException(status_code=400, detail='squares must be like e2')
         success, message = node.execute_move(from_sq, to_sq)
         if not success:
-            raise HTTPException(status_code=400, detail=message)
+            status = 409 if 'not robot turn' in message else 400
+            raise HTTPException(status_code=status, detail=message)
         return {
             'success': success,
             'message': message,

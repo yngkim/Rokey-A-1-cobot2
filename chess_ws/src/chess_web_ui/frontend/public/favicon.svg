@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect x="2" y="2" width="96" height="96" rx="22" fill="#21201d" stroke="#3d3b39" stroke-width="2" />
+
+  <!-- low-poly robotic knight, facing right -->
+  <polygon
+    points="
+      18,92 70,92 72,78 80,68 78,58 86,54 94,50 96,42
+      86,40 82,30 72,18 62,12 56,4 58,17 50,19
+      44,26 48,32 40,38 44,44 36,50 40,56 32,62 36,68 28,74
+    "
+    fill="#81b64c"
+  />
+
+  <!-- armor seams across the neck -->
+  <line x1="22" y1="80" x2="70" y2="80" stroke="#21201d" stroke-width="3" stroke-linecap="round" />
+  <line x1="20" y1="86" x2="70" y2="86" stroke="#21201d" stroke-width="3" stroke-linecap="round" />
+
+  <!-- robot eye / visor -->
+  <rect x="66" y="30" width="15" height="6" rx="3" fill="#e7f5d9" />
+  <rect x="69" y="31.5" width="9" height="3" rx="1.5" fill="#a3d160" />
+
+  <!-- rivet on the jaw -->
+  <circle cx="88" cy="53" r="1.6" fill="#21201d" />
+
+  <!-- circuit trace off the shoulder -->
+  <path d="M28,74 L16,82 L9,82" fill="none" stroke="#a3d160" stroke-width="2.2" stroke-linecap="round" />
+  <circle cx="7" cy="82" r="3" fill="none" stroke="#a3d160" stroke-width="2.2" />
+</svg>

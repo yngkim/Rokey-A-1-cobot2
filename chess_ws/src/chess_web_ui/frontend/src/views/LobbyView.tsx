@@ -3,6 +3,8 @@ import {
   DIFFICULTY_LABELS,
   Difficulty,
   HumanColor,
+  SavedGameSummary,
+  fetchSavedGames,
 } from '../chess';
 import type { TtsMode, TtsVoicePreset, UserSettings } from '../lib/userSettings';
 import {
@@ -11,6 +13,7 @@ import {
   saveUserSettings,
 } from '../lib/userSettings';
 import { loadVoicePresets, speakText } from '../lib/ttsVoices';
+import { useEffect, useState } from 'react';
 
 const DIFFICULTY_INFO: Record<Difficulty, { title: string; desc: string; emoji: string }> = {
   beginner: { title: '입문', desc: 'Elo ~700 · 천천히 두는 연습 봇', emoji: '🌱' },
@@ -33,7 +36,32 @@ type Props = {
   onBoardOrientation: (o: BoardOrientation) => void;
   onUserSettings: (settings: UserSettings) => void;
   onStart: () => void;
+  onResume: () => void;
+  onLoadGame: (gameId: string) => void;
 };
+
+function formatSavedAt(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return date.toLocaleString('ko-KR', {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function savedGameLabel(game: SavedGameSummary): string {
+  const color = game.human_color === 'white' ? '백' : '흑';
+  const diff = DIFFICULTY_LABELS[game.difficulty] ?? game.difficulty;
+  const phase =
+    game.game_phase === 'finished'
+      ? '종료'
+      : game.game_phase === 'playing'
+        ? `${game.move_count}수`
+        : '로비';
+  return `${formatSavedAt(game.updated_at)} · ${diff} · ${color} · ${phase}`;
+}
 
 export default function LobbyView({
   difficulty,
@@ -46,7 +74,31 @@ export default function LobbyView({
   onBoardOrientation,
   onUserSettings,
   onStart,
+  onResume,
+  onLoadGame,
 }: Props) {
+  const [savedGames, setSavedGames] = useState<SavedGameSummary[]>([]);
+  const [savedGamesError, setSavedGamesError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchSavedGames()
+      .then((games) => {
+        if (!cancelled) setSavedGames(games);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setSavedGamesError(err instanceof Error ? err.message : '저장 목록 로드 실패');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const resumeCandidate = savedGames.find(
+    (game) => game.is_active && game.game_phase === 'playing',
+  );
   const updateSettings = (patch: Partial<UserSettings>) => {
     const next = { ...userSettings, ...patch };
     saveUserSettings(next);
@@ -69,7 +121,13 @@ export default function LobbyView({
 
   return (
     <div className="lobby">
-      <h1>로봇 체스 대결</h1>
+      <div className="lobby-hero">
+        <img src="/favicon.svg" alt="ChessMate" className="lobby-logo" />
+        <div>
+          <h1>ChessMate</h1>
+          <p className="lobby-tagline">로봇 체스 대결</p>
+        </div>
+      </div>
       <p className="lobby-sub">난이도와 색을 고른 뒤 실제 보드에서 대국을 시작하세요.</p>
 
       <div className="difficulty-grid difficulty-grid-5">
@@ -200,6 +258,46 @@ export default function LobbyView({
           />
           <span>손 감지 자동 수 확인 (기본 OFF)</span>
         </label>
+      </section>
+
+      <section className="saved-games-section">
+        <h2>저장된 게임</h2>
+        <p className="lobby-sub lobby-hint">
+          진행 중인 게임은 자동 저장됩니다. 재시작 후 「이어하기」로 복원할 수 있습니다.
+        </p>
+        {resumeCandidate ? (
+          <button
+            type="button"
+            className="resume-btn"
+            onClick={onResume}
+            disabled={busy}
+          >
+            이어하기 ({savedGameLabel(resumeCandidate)})
+          </button>
+        ) : null}
+        {savedGamesError ? <p className="saved-games-error">{savedGamesError}</p> : null}
+        {savedGames.length > 0 ? (
+          <ul className="saved-games-list">
+            {savedGames.map((game) => (
+              <li key={game.id} className={game.is_active ? 'saved-game-active' : ''}>
+                <div className="saved-game-meta">
+                  <strong>{savedGameLabel(game)}</strong>
+                  <span className="saved-game-id">{game.id.slice(0, 8)}</span>
+                </div>
+                <button
+                  type="button"
+                  className="saved-game-load-btn"
+                  onClick={() => onLoadGame(game.id)}
+                  disabled={busy}
+                >
+                  불러오기
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="lobby-sub">저장된 게임이 없습니다.</p>
+        )}
       </section>
 
       <button type="button" className="start-btn" onClick={onStart} disabled={busy}>

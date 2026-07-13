@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import threading
 
+import chess
 import rclpy
 from chess_msgs.msg import BoardOccupancy, BoardState, GameSnapshot
 from chess_msgs.srv import (
@@ -20,6 +21,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Bool, Header
 
+from chess_web_ui.agent_debug_log import agent_log
 from chess_web_ui.vision_session import VisionSession
 
 
@@ -40,6 +42,7 @@ class VisionGameNode(Node):
         self.declare_parameter('auto_detect_stable_frames', 4)
         self.declare_parameter('depth_empty_square_min_conf', 0.42)
         self.declare_parameter('fen_snap_baseline', True)
+        self.declare_parameter('human_color', 'white')
         self.session = VisionSession()
         self.session.configure_depth_filter(
             empty_square_min_conf=float(self.get_parameter('depth_empty_square_min_conf').value),
@@ -94,6 +97,14 @@ class VisionGameNode(Node):
 
         self.get_logger().info('Vision game node ready')
         self._startup_timer = self.create_timer(1.0, self._publish_startup_state)
+
+    def _human_color(self) -> str:
+        return str(self.get_parameter('human_color').value).strip().lower() or 'white'
+
+    def _is_human_turn(self) -> bool:
+        board = chess.Board(self.session.game.fen)
+        human_white = self._human_color() == 'white'
+        return board.turn == chess.WHITE if human_white else board.turn == chess.BLACK
 
     def _publish_startup_state(self) -> None:
         self._publish_state(
@@ -195,6 +206,10 @@ class VisionGameNode(Node):
             return
         if self._busy or not msg.valid or self._hand_in_board:
             return
+        if not self._is_human_turn():
+            self._live_stable = 0
+            self._live_cells = None
+            return
 
         cells = list(msg.occupancy.cells)
         confidence = _confidence_list(msg.occupancy.confidence)
@@ -218,7 +233,28 @@ class VisionGameNode(Node):
         self._live_stable = 0
         self._live_cells = None
         if not outcome.success:
+            agent_log(
+                'vision_game_node.py:_on_live_occupancy',
+                'auto_detect rejected',
+                {
+                    'message': outcome.message,
+                    'fen': self.session.game.fen,
+                    'human_turn': self._is_human_turn(),
+                },
+                hypothesis_id='A',
+            )
             return
+
+        agent_log(
+            'vision_game_node.py:_on_live_occupancy',
+            'auto_detect accepted',
+            {
+                'uci': outcome.uci,
+                'fen_before': outcome.fen_before,
+                'fen_after': outcome.fen,
+            },
+            hypothesis_id='A',
+        )
 
         if outcome.uci and outcome.fen_before:
             game_id = f'auto_move:{outcome.uci}##{outcome.fen_before}'

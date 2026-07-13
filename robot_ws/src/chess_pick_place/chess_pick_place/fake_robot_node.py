@@ -16,6 +16,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Bool, Header
+from std_srvs.srv import Trigger
 
 from chess_robot_motion.safety_gate import SafetyGate
 
@@ -37,7 +38,7 @@ class FakeRobotNode(Node):
     def __init__(self) -> None:
         super().__init__('fake_robot_node')
         self.declare_parameter('publish_board_state', True)
-        self.declare_parameter('home_joints', [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17])
+        self.declare_parameter('home_joints', [-12.32, 22.41, 36.08, -0.09, 121.46, -13.86])
         self.declare_parameter('robot_color', 'black')
         self.declare_parameter('board_orientation', 'standard')
         self.declare_parameter('graveyard_enabled', True)
@@ -62,6 +63,9 @@ class FakeRobotNode(Node):
         self.create_service(MoveToObserve, 'robot/move_to_observe', self.handle_observe, callback_group=group)
         self.create_service(RetreatArm, 'robot/retreat_arm', self.handle_retreat, callback_group=group)
         self.create_service(UndoMoves, 'robot/undo_moves', self.handle_undo_moves, callback_group=group)
+        self.create_service(Trigger, 'robot/user_stop', self.handle_user_stop, callback_group=group)
+        self.create_service(Trigger, 'robot/user_stop_resume', self.handle_user_stop_resume, callback_group=group)
+        self.create_service(Trigger, 'robot/user_stop_abort', self.handle_user_stop_abort, callback_group=group)
         self.create_subscription(
             Bool,
             'chess/hand_in_board',
@@ -83,7 +87,7 @@ class FakeRobotNode(Node):
             RestoreBoard,
             'robot/restore_board',
             execute_callback=self.execute_restore_board,
-            goal_callback=self.goal_callback,
+            goal_callback=self.restore_goal_callback,
             cancel_callback=self.cancel_callback,
             callback_group=group,
         )
@@ -141,6 +145,11 @@ class FakeRobotNode(Node):
 
     def _robot_color(self) -> str:
         return robot_chess_color(self._human_color())
+
+    def _is_robot_turn(self) -> bool:
+        board = chess.Board(self.board.fen)
+        robot_is_white = self._robot_color() == 'white'
+        return board.turn == chess.WHITE if robot_is_white else board.turn == chess.BLACK
 
     def _use_graveyard_for_capture(self, captured_symbol: str | None) -> bool:
         del captured_symbol
@@ -301,7 +310,56 @@ class FakeRobotNode(Node):
         response.message = 'safe pose reached'
         return response
 
+    def handle_user_stop(self, request, response):
+        del request
+        self._safety_gate.request_pause()
+        self.get_logger().info('user stop — motion halted (stub)')
+        response.success = True
+        response.message = 'stopped'
+        return response
+
+    def handle_user_stop_resume(self, request, response):
+        del request
+        self._safety_gate.resume()
+        self.get_logger().info('user stop resume — motion gate open (stub)')
+        response.success = True
+        response.message = 'resumed'
+        return response
+
+    def handle_user_stop_abort(self, request, response):
+        del request
+        self._safety_gate.request_cancel()
+        self._safety_gate.clear_cancel()
+        self._safety_gate.resume()
+        self.get_logger().info('user stop abort — canceled (stub)')
+        response.success = True
+        response.message = 'aborted'
+        return response
+
     def goal_callback(self, goal_request):
+        move = goal_request.move
+        from_col = int(move.from_square.col)
+        from_row = int(move.from_square.row)
+        from_name = f'{chr(ord("a") + from_col)}{from_row + 1}'
+        to_col = int(move.to_square.col)
+        to_row = int(move.to_square.row)
+        to_name = f'{chr(ord("a") + to_col)}{to_row + 1}'
+        raw_uci = f'{from_name}{to_name}{move.promotion or ""}'
+
+        validation = self.board.validate_uci(raw_uci)
+        if not validation.ok:
+            self.get_logger().warn(f'execute_move goal rejected: {validation.message}')
+            return GoalResponse.REJECT
+        # No robot-turn/robot-piece re-check — validate_uci() already requires the
+        # move be legal for whoever's turn self.board shows, which now legitimately
+        # includes the human's own turn for voice-assisted moves (see the matching
+        # fix in doosan_pick_place_node.py).
+        return GoalResponse.ACCEPT
+
+    def restore_goal_callback(self, goal_request):
+        # RestoreBoard.Goal has no fields — must not reuse execute_move's
+        # goal_callback, which unconditionally reads goal_request.move (an
+        # ExecuteMove-only field) and would raise AttributeError here.
         del goal_request
         return GoalResponse.ACCEPT
 
@@ -332,6 +390,7 @@ class FakeRobotNode(Node):
             result.success = False
             result.message = validation.message
             return result
+        # No robot-turn/robot-piece re-check here either — see goal_callback().
 
         self._at_observe_pose = False
 

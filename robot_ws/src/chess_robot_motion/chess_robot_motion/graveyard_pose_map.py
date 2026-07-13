@@ -56,6 +56,7 @@ class GraveyardPoseMap:
         anchor_col: int = 7,
         z_pick_mm: float | None = None,
         z_travel_mm: float | None = None,
+        z_place_mm: float | None = None,
     ) -> None:
         if len(anchor_h9_posx) < 6:
             raise ValueError('anchor_h9_posx must be [x,y,z,rx,ry,rz]')
@@ -68,6 +69,9 @@ class GraveyardPoseMap:
         self.row_step_mm = row_step_mm
         self.z_pick_mm = self.anchor_z if z_pick_mm is None else z_pick_mm
         self.z_travel_mm = (self.z_pick_mm + 90.0) if z_travel_mm is None else z_travel_mm
+        # Separate "place into slot" depth (defaults to z_pick_mm — used when picking a
+        # piece back out of the graveyard, e.g. during restore, must stay unaffected).
+        self.z_place_mm = self.z_pick_mm if z_place_mm is None else z_place_mm
         self.travel_extra_mm = 0.0
 
     @property

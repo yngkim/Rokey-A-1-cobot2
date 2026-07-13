@@ -34,6 +34,34 @@ def test_graveyard_slots_roundtrip():
         assert 'p' in loaded.graveyard_slots
 
 
+def test_list_load_and_mark_active():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = GameStore(Path(tmp) / 'games.db')
+        first = store.create_new_game(fen=START_FEN, human_color='white')
+        first.fen = 'rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1'
+        store.save_game(first)
+
+        second = store.create_new_game(fen=START_FEN, human_color='black')
+        second.fen = 'rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq e6 0 2'
+        store.save_game(second)
+
+        games = store.list_games(limit=10)
+        assert len(games) == 2
+        assert games[0].id == second.id
+
+        loaded = store.load_game(first.id)
+        assert loaded is not None
+        assert loaded.human_color == 'white'
+
+        store.mark_active(first.id)
+        active = store.load_active_game()
+        assert active is not None
+        assert active.id == first.id
+        inactive = store.load_game(second.id)
+        assert inactive is not None
+        assert inactive.is_active is False
+
+
 def test_human_graveyard_slots_roundtrip():
     slots = place_in_graveyard([None] * 16, 'white', 'n')
     with tempfile.TemporaryDirectory() as tmp:

@@ -34,3 +34,32 @@ def infer_human_move_uci(fen_before: str, fen_after: str, human_color: str) -> s
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+def guard_correction_fen(fen_before: str, fen: str) -> str:
+    """Board correction edits piece placement only — never let a client-submitted
+    FEN silently drop castling/halfmove/fullmove metadata (e.g. a stale/short
+    source FEN on the frontend) and desync the move counter from move_history.
+
+    That desync is unrecoverable downstream: the bot-move trust check rejects the
+    FEN forever and the robot stops responding. If the submitted counters look
+    regressed relative to the known board, keep the trusted counters and only
+    take the edited placement/turn.
+    """
+    try:
+        before = chess.Board(fen_before)
+        candidate = chess.Board(fen)
+    except ValueError:
+        return fen
+    if candidate.fullmove_number >= before.fullmove_number:
+        return fen
+    parts = fen.split()
+    if len(parts) < 2:
+        return fen
+    placement, active = parts[0], parts[1]
+    before_parts = fen_before.split()
+    castling = before_parts[2] if len(before_parts) > 2 else '-'
+    ep = before_parts[3] if len(before_parts) > 3 else '-'
+    halfmove = before_parts[4] if len(before_parts) > 4 else '0'
+    fullmove = before_parts[5] if len(before_parts) > 5 else '1'
+    return f'{placement} {active} {castling} {ep} {halfmove} {fullmove}'

@@ -14,46 +14,55 @@ pick_place_node:
     gripper_name: rg2
     gripper_ip: "192.168.1.1"
     gripper_port: "502"
-    velocity: 150.0
-    acceleration: 150.0
-    pick_velocity: 130.0
-    pick_acceleration: 130.0
-    place_velocity: 95.0
-    place_acceleration: 95.0
-    retreat_velocity: 115.0
-    retreat_acceleration: 115.0
-    home_velocity: 70.0
-    home_acceleration: 70.0
+    velocity: 347.8
+    acceleration: 347.8
+    pick_velocity: 301.4
+    pick_acceleration: 301.4
+    place_velocity: 220.3
+    place_acceleration: 220.3
+    retreat_velocity: 266.6
+    retreat_acceleration: 266.6
+    home_velocity: 162.3
+    home_acceleration: 162.3
     z_approach_offset_mm: 0.0
     robot_id: dsr01
     robot_model: m0609
-    home_joints: [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17]
+    home_joints: [-12.32, 22.41, 36.08, -0.09, 121.46, -13.86]
     robot_color: black
     board_orientation: "standard"
     graveyard_enabled: true
     graveyard_h9_joints: [-37.12, 8.08, 106.52, -0.02, 65.41, -36.25]
-    # h9 anchor TCP [x,y,z,rx,ry,rz] — refine from teach pendant if placement is off
-    graveyard_h9_posx: [310.274, -124.264, 266.273, 2.805, 179.832, 2.749]
+    # h9 anchor TCP [x,y,z,rx,ry,rz] — measured directly from teach pendant task-frame
+    # coords. Orientation is NOT the board's flat orientation (2.805, 179.832, 2.749) —
+    # h9 is approached at a rotated TCP angle, same as a0. Previous values here were
+    # estimates computed from board geometry, not measured, and kept the wrong
+    # (board) orientation — that's why placement was landing to the side even after
+    # the Y shift.
+    graveyard_h9_posx: [313.41, -229.45, 266.03, 21.45, -179.97, 21.24]
     graveyard_square_mm: 40.0
     graveyard_col_step_mm: -40.0
     graveyard_row_step_mm: -40.0
-    # 흑 graveyard place 높이 보정 (음수 = 더 낮게). 2.5cm 낮춤
-    graveyard_z_offset_mm: -25.0
-    graveyard_z_pick_offset_mm: -25.0
+    # 흑 graveyard pick/place 높이 보정 — 전부 0으로 초기화 (요청에 따라 오프셋 제거)
+    graveyard_z_offset_mm: 0.0
+    graveyard_z_pick_offset_mm: 0.0
+    graveyard_z_place_offset_mm: 0.0
     # graveyard XY 이동 시 보드 travel 대비 추가 높이
     graveyard_z_travel_extra_mm: 0.0
     # optional; 0 = use h9 teach TCP z / anchor z + 90mm
     graveyard_z_pick_mm: 0.0
     graveyard_z_travel_mm: 0.0
     graveyard_a0_joints: [20.12, 41.84, 55.64, -0.03, 82.52, 15.62]
-    # Taught TCP for white GY a0 (joint teach only on human_color side change).
-    # Grid from a0 pick/place teach: b0 = -40mm X, a-1 = +40mm Y
-    graveyard_a0_posx: [590.274, 175.736, 271.273, 2.805, 179.832, 2.749]
+    # task-frame TCP at a0 pick/place teach (no joint calibration moves).
+    # z lowered 3mm from the taught 270.85 — offsets are 0 so pick/place both
+    # derive straight from this z (no offset stacking needed).
+    graveyard_a0_posx: [596.78, 225.25, 267.85, 26.39, -180.0, 21.9]
     graveyard_a0_anchor_from_joints: false
     graveyard_teach_velocity: 25.0
     graveyard_h9_anchor_from_joints: false
     white_graveyard_col_step_mm: -40.0
     white_graveyard_row_step_mm: 40.0
-    white_graveyard_z_pick_offset_mm: -20.0
+    # 백 graveyard pick/place 높이 보정 — 전부 0으로 초기화 (요청에 따라 오프셋 제거)
+    white_graveyard_z_pick_offset_mm: 0.0
+    white_graveyard_z_place_offset_mm: 0.0
     # observe 탑뷰 홈 (teach pendant로 측정 후 교체). vision_manual 모드에서는 publish false.
     publish_board_state: true

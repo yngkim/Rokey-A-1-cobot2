@@ -90,6 +90,36 @@ def test_vision_manual_overlay_white_graveyard_col_step():
     assert params['white_graveyard_row_step_mm'] == 40.0
 
 
+def test_graveyard_pose_map_z_place_defaults_to_z_pick():
+    anchor = [100.0, 200.0, 300.0, 1.0, 2.0, 3.0]
+    gmap = GraveyardPoseMap(anchor, z_pick_mm=310.0)
+    assert gmap.z_place_mm == 310.0
+
+
+def test_graveyard_pose_map_z_place_can_be_lowered_independently():
+    anchor = [100.0, 200.0, 300.0, 1.0, 2.0, 3.0]
+    gmap = GraveyardPoseMap(anchor, z_pick_mm=310.0, z_place_mm=307.0)
+    assert gmap.z_pick_mm == 310.0
+    assert gmap.z_place_mm == 307.0
+
+
+def test_robot_params_white_graveyard_place_offset_defaults_safe():
+    # A -3.0 test value caused the arm to stall mid gy_descend (likely pressing
+    # into the tray surface) — keep this at a safe 0.0 until re-tuned carefully
+    # in small steps with physical verification.
+    repo_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..', '..', '..')
+    )
+    for filename in ('robot_params.yaml', 'vision_manual_robot_params.yaml'):
+        path = os.path.join(
+            repo_root, 'robot_ws', 'src', 'chess_robot_bringup', 'config', filename
+        )
+        with open(path, encoding='utf-8') as fh:
+            data = yaml.safe_load(fh)
+        params = data['pick_place_node']['ros__parameters']
+        assert params['white_graveyard_z_place_offset_mm'] == 0.0
+
+
 def test_board_piece_at_from_fen():
     board = BoardStateManager()
     assert board.piece_at(0, 0) == 'R'

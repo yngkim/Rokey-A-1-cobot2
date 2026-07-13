@@ -9,6 +9,7 @@ import threading
 import time
 from enum import Enum
 
+import chess
 import rclpy
 from chess_msgs.action import ExecuteMove, RestoreBoard
 from chess_msgs.msg import BoardOccupancy, BoardState, GameSnapshot
@@ -19,6 +20,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_msgs.msg import Bool, Header
+from std_srvs.srv import Trigger
 
 from chess_robot_motion.board_restore_planner import RestoreMove
 from chess_robot_motion.board_state_manager import BoardStateManager
@@ -55,6 +57,29 @@ class MotionSegment(str, Enum):
     GY_TRAVEL = 'gy_travel'
     GY_DESCEND = 'gy_descend'
     GY_ASCEND = 'gy_ascend'
+    RESTORE = 'restore'
+
+
+# Cap on _ensure_goal_active <-> _replay_motion_segment re-entries per goal (see
+# DoosanPickPlaceNode._replay_attempts) — guards against a RecursionError crash when
+# the hand signal flickers faster than a segment can complete.
+_MAX_REPLAY_ATTEMPTS = 50
+
+# Arm must enter the board ROI during capture/graveyard — ignore hand safety there.
+_HAND_IMMUNE_SEGMENTS = frozenset(
+    {
+        MotionSegment.CAPTURE_TRAVEL,
+        MotionSegment.CAPTURE_DESCEND,
+        MotionSegment.CAPTURE_ASCEND,
+        MotionSegment.GY_TRAVEL,
+        MotionSegment.GY_DESCEND,
+        MotionSegment.GY_ASCEND,
+        MotionSegment.RESTORE,
+    }
+)
+
+
+from chess_pick_place.agent_debug_log import agent_log
 
 
 class DoosanPickPlaceNode(Node):
@@ -69,7 +94,15 @@ class DoosanPickPlaceNode(Node):
         self._safety_gate = SafetyGate(move_stop=dsr_api.move_stop)
         self._motion_segment = MotionSegment.NONE
         self._segment_ctx: dict = {}
+        self._execute_in_progress = False
         self._at_observe_pose = False
+        # _ensure_goal_active <-> _replay_motion_segment can re-enter each other every
+        # time a hand-safety interruption clears mid-replay. A rapidly flickering hand
+        # signal (many pause/resume cycles per second) can otherwise recurse until
+        # Python's recursion limit is hit and the goal crashes with an unhandled
+        # RecursionError. This counts replay attempts per goal so we abort cleanly
+        # instead once the arm has clearly been stuck fighting the same interruption.
+        self._replay_attempts = 0
         self._init_gripper()
 
         self._human_color_value = default_human_color_from_robot_param(
@@ -126,6 +159,9 @@ class DoosanPickPlaceNode(Node):
         self.create_service(MoveToObserve, 'robot/move_to_observe', self.handle_observe, callback_group=group)
         self.create_service(RetreatArm, 'robot/retreat_arm', self.handle_retreat, callback_group=group)
         self.create_service(UndoMoves, 'robot/undo_moves', self.handle_undo_moves, callback_group=group)
+        self.create_service(Trigger, 'robot/user_stop', self.handle_user_stop, callback_group=group)
+        self.create_service(Trigger, 'robot/user_stop_resume', self.handle_user_stop_resume, callback_group=group)
+        self.create_service(Trigger, 'robot/user_stop_abort', self.handle_user_stop_abort, callback_group=group)
         self.create_subscription(
             Bool,
             'chess/hand_in_board',
@@ -147,7 +183,7 @@ class DoosanPickPlaceNode(Node):
             RestoreBoard,
             'robot/restore_board',
             execute_callback=self.execute_restore_board,
-            goal_callback=self.goal_callback,
+            goal_callback=self.restore_goal_callback,
             cancel_callback=self.cancel_callback,
             callback_group=group,
         )
@@ -182,7 +218,16 @@ class DoosanPickPlaceNode(Node):
     def _go_home(self) -> None:
         joints = list(self.get_parameter('home_joints').value)
         self.get_logger().info(f'movej home: {joints}')
-        self._movej(joints, vel=self._home_vel(), acc=self._home_acc())
+        ret = self._movej(joints, vel=self._home_vel(), acc=self._home_acc())
+        # movej() returns 0 on success, -1 if the DSR controller rejected the
+        # command (e.g. vel/acc over a configured safety limit). Ignoring this used
+        # to leave the arm wherever it stalled while the software still marked
+        # itself "at observe pose" and let the goal finish as if home succeeded.
+        if ret not in (0, None):
+            raise RuntimeError(
+                f'movej home rejected by controller (ret={ret}) '
+                '— check DSR safety velocity/acceleration limits'
+            )
         self._mwait()
         self._at_observe_pose = True
 
@@ -196,8 +241,27 @@ class DoosanPickPlaceNode(Node):
                 fn()
                 return
             except MotionInterrupted:
+                self._replay_attempts += 1
+                if self._replay_attempts > _MAX_REPLAY_ATTEMPTS:
+                    goal_handle.abort()
+                    agent_log(
+                        'doosan_pick_place_node.py:_run_motion_step',
+                        'ABORT too many hand interruptions (flickering signal)',
+                        {
+                            'segment': self._motion_segment.value,
+                            'replay_attempts': self._replay_attempts,
+                        },
+                        hypothesis_id='C',
+                    )
+                    self.get_logger().error(
+                        f'aborting move: {self._replay_attempts} hand interruptions in '
+                        f'{self._motion_segment.value} — hand signal may be flickering, '
+                        'check camera/lighting'
+                    )
+                    raise RuntimeError('too many hand interruptions') from None
                 self.get_logger().info(
-                    f'motion interrupted during {self._motion_segment.value} — recovering'
+                    f'motion interrupted during {self._motion_segment.value} — recovering '
+                    f'(attempt {self._replay_attempts}/{_MAX_REPLAY_ATTEMPTS})'
                 )
                 self._ensure_goal_active(goal_handle)
                 self.motion.ensure_travel_height(self._segment_ctx.get('pose_map'))
@@ -291,13 +355,17 @@ class DoosanPickPlaceNode(Node):
         if self._robot_graveyard_side() != prev_robot_side:
             self._graveyard_pose_maps.clear()
             self._reload_graveyard_pose_maps()
-            self._ensure_joint_graveyard_anchors()
 
     def _graveyard_enabled(self) -> bool:
         return bool(self.get_parameter('graveyard_enabled').value)
 
     def _robot_color(self) -> str:
         return robot_chess_color(self._human_color())
+
+    def _is_robot_turn(self) -> bool:
+        board = chess.Board(self.board.fen)
+        robot_is_white = self._robot_color() == 'white'
+        return board.turn == chess.WHITE if robot_is_white else board.turn == chess.BLACK
 
     def _resolve_captured_symbol(self, captured_symbol: str | None) -> str:
         if captured_symbol:
@@ -350,7 +418,7 @@ class DoosanPickPlaceNode(Node):
             7,
         )
 
-    def _graveyard_z_levels(self, side: str, anchor_z: float) -> tuple[float, float]:
+    def _graveyard_z_levels(self, side: str, anchor_z: float) -> tuple[float, float, float]:
         z_pick_param = self.get_parameter('graveyard_z_pick_mm').value
         z_travel_param = self.get_parameter('graveyard_z_travel_mm').value
         z_pick_mm = float(z_pick_param) if z_pick_param is not None and float(z_pick_param) > 0 else float(anchor_z)
@@ -367,11 +435,19 @@ class DoosanPickPlaceNode(Node):
             z_pick_mm += pick_offset
         elif side == 'white':
             z_pick_mm += white_pick_offset
-        return z_pick_mm, z_travel_mm
+        # z_place_mm: depth used only when placing a captured piece INTO the graveyard
+        # slot. Defaults to z_pick_mm (unchanged) plus a side-specific place offset, so
+        # picking a piece back out (restore) is unaffected.
+        z_place_mm = z_pick_mm
+        if side == 'white':
+            z_place_mm += float(self.get_parameter('white_graveyard_z_place_offset_mm').value)
+        elif side == 'black':
+            z_place_mm += float(self.get_parameter('graveyard_z_place_offset_mm').value)
+        return z_pick_mm, z_travel_mm, z_place_mm
 
     def _build_graveyard_pose_map(self, side: str, anchor_posx: list[float]) -> GraveyardPoseMap:
         anchor_name, col_step, row_step, anchor_col = self._graveyard_side_params(side)
-        z_pick_mm, z_travel_mm = self._graveyard_z_levels(side, anchor_posx[2])
+        z_pick_mm, z_travel_mm, z_place_mm = self._graveyard_z_levels(side, anchor_posx[2])
         gy_map = GraveyardPoseMap(
             anchor_h9_posx=anchor_posx,
             col_step_mm=col_step,
@@ -379,11 +455,12 @@ class DoosanPickPlaceNode(Node):
             anchor_col=anchor_col,
             z_pick_mm=z_pick_mm,
             z_travel_mm=z_travel_mm,
+            z_place_mm=z_place_mm,
         )
         gy_map.travel_extra_mm = float(self.get_parameter('graveyard_z_travel_extra_mm').value)
         self.get_logger().info(
             f'graveyard {anchor_name} from params: xy={gy_map.anchor_x},'
-            f'{gy_map.anchor_y} z_pick={gy_map.z_pick_mm} '
+            f'{gy_map.anchor_y} z_pick={gy_map.z_pick_mm} z_place={gy_map.z_place_mm} '
             f'z_travel={gy_map.z_travel_mm} travel_extra={gy_map.travel_extra_mm}'
         )
         return gy_map
@@ -401,83 +478,37 @@ class DoosanPickPlaceNode(Node):
         self._graveyard_pose_maps.clear()
         self._init_graveyard_pose_maps_from_params()
 
-    def _calibrate_graveyard(self, side: str, *, return_home: bool = True) -> None:
-        side = side.strip().lower()
-        if side in self._graveyard_pose_maps:
-            if return_home:
-                self._go_home()
-            return
-        posx = self._graveyard_posx_from_params(side)
-        if posx is not None:
-            self._graveyard_pose_maps[side] = self._build_graveyard_pose_map(side, posx)
-            if return_home:
-                self._go_home()
-            return
-        anchor_name, col_step, row_step, anchor_col = self._graveyard_side_params(side)
-        if side == 'white':
-            joints = list(self.get_parameter('graveyard_a0_joints').value)
-        else:
-            joints = list(self.get_parameter('graveyard_h9_joints').value)
-        self.get_logger().info(
-            f'graveyard {side}: joint teach anchor at {anchor_name}'
-        )
-        teach_vel = float(self.get_parameter('graveyard_teach_velocity').value)
-        self.get_logger().info(
-            f'graveyard calibration: movej {anchor_name} {joints} vel={teach_vel}'
-        )
-        self._movej(joints, vel=teach_vel, acc=self._home_acc())
-        self._mwait()
-        anchor = list(self._get_current_posx()[0])
-        z_pick_mm, z_travel_mm = self._graveyard_z_levels(side, anchor[2])
-        gy_map = GraveyardPoseMap(
-            anchor_h9_posx=anchor,
-            col_step_mm=col_step,
-            row_step_mm=row_step,
-            anchor_col=anchor_col,
-            z_pick_mm=z_pick_mm,
-            z_travel_mm=z_travel_mm,
-        )
-        gy_map.travel_extra_mm = float(self.get_parameter('graveyard_z_travel_extra_mm').value)
-        self._graveyard_pose_maps[side] = gy_map
-        pose_map = self._graveyard_pose_maps[side]
-        self.get_logger().info(
-            f'graveyard {anchor_name} anchor: xy={pose_map.anchor_x},'
-            f'{pose_map.anchor_y} z_pick={pose_map.z_pick_mm} '
-            f'z_travel={pose_map.z_travel_mm} travel_extra={pose_map.travel_extra_mm}'
-        )
-        self.get_logger().info(
-            f'graveyard {anchor_name} taught TCP posx='
-            f'[{pose_map.anchor_x:.3f}, {pose_map.anchor_y:.3f}, {pose_map.z_pick_mm:.3f}, '
-            f'{pose_map.fixed_orientation[0]:.3f}, {pose_map.fixed_orientation[1]:.3f}, '
-            f'{pose_map.fixed_orientation[2]:.3f}]'
-        )
-        if return_home:
-            self._go_home()
-
-    def _ensure_joint_graveyard_anchors(self) -> None:
-        if not self._graveyard_enabled():
-            return
-        for side in ('black', 'white'):
-            if self._graveyard_use_joint_anchor(side) and side not in self._graveyard_pose_maps:
-                self._calibrate_graveyard(side, return_home=True)
-
-    def _ensure_graveyard_calibrated(self, side: str, *, return_home: bool = True) -> None:
-        if side not in self._graveyard_pose_maps:
-            self._calibrate_graveyard(side, return_home=return_home)
-
     def _graveyard_pose_map_for(self, side: str) -> GraveyardPoseMap:
         if side not in self._graveyard_pose_maps:
-            self._ensure_graveyard_calibrated(side, return_home=False)
-        if side not in self._graveyard_pose_maps:
-            raise RuntimeError(f'graveyard {side} not calibrated')
+            posx = self._graveyard_posx_from_params(side)
+            if posx is None:
+                raise RuntimeError(
+                    f'graveyard {side} posx missing in params — no physical calibration'
+                )
+            self._graveyard_pose_maps[side] = self._build_graveyard_pose_map(side, posx)
         return self._graveyard_pose_maps[side]
 
     def _place_captured_in_graveyard(self, captured_symbol: str, goal_handle) -> None:
-        side = self._robot_graveyard_side()
+        # A captured piece is always the *opposite* color of whoever captured it,
+        # so the captured piece's own color tells us which graveyard it belongs
+        # in: if it's the robot's own color, the human captured it (including via
+        # a voice-commanded move the arm executes on their behalf), so it goes in
+        # the human's graveyard, not the robot's. This used to always use the
+        # robot's own side/state unconditionally, which — for any human capture —
+        # sent the piece toward the wrong (possibly full/differently-calibrated)
+        # graveyard and left it desynced from web_bridge's own graveyard tracking
+        # (which correctly attributes it to the human).
+        captured_is_robot_color = captured_symbol.isupper() == (self._robot_color() == 'white')
+        if captured_is_robot_color:
+            side = self._human_graveyard_side()
+            graveyard = self.human_graveyard
+        else:
+            side = self._robot_graveyard_side()
+            graveyard = self.robot_graveyard
         pose_map = self._graveyard_pose_map_for(side)
-        if self.robot_graveyard.is_full():
+        if graveyard.is_full():
             raise RuntimeError('graveyard full (16 slots occupied)')
-        slot = self.robot_graveyard.next_empty_slot()
+        slot = graveyard.next_empty_slot()
         if slot is None:
             raise RuntimeError('graveyard full (no empty slot)')
         grave_col, grave_row = slot
@@ -485,7 +516,7 @@ class DoosanPickPlaceNode(Node):
         target_x, target_y = pose_map.square_center_xy(grave_col, grave_row)
         self.get_logger().info(
             f'graveyard place {slot_name} side={side} ({captured_symbol}) '
-            f'xy=({target_x:.3f},{target_y:.3f}) z_pick={pose_map.z_pick_mm:.3f}'
+            f'xy=({target_x:.3f},{target_y:.3f}) z_place={pose_map.z_place_mm:.3f}'
         )
 
         self._set_motion_segment(
@@ -495,7 +526,21 @@ class DoosanPickPlaceNode(Node):
             pose_map=pose_map,
         )
         self._ensure_goal_active(goal_handle)
-        self._run_motion_step(goal_handle, lambda: self.motion.ensure_travel_height(pose_map))
+
+        def _gy_travel() -> None:
+            # Cross to the graveyard slot's XY at the board's travel height
+            # (calibrated to clear every board square) — arm is currently
+            # positioned directly over the just-captured board square, and the
+            # naive "ensure_travel_height(graveyard_pose_map) then move" order
+            # switches Z down to the graveyard's own (potentially lower)
+            # calibration BEFORE flying back over the rest of the board,
+            # risking a collision with pieces still on it. Only switch to the
+            # graveyard's travel height once already positioned over the
+            # graveyard.
+            self.motion.move_xy_at_height(grave_col, grave_row, pose_map, self.pose_map.z_travel_mm)
+            self.motion.ensure_travel_height(pose_map)
+
+        self._run_motion_step(goal_handle, _gy_travel)
 
         self._set_motion_segment(
             MotionSegment.GY_DESCEND,
@@ -506,7 +551,6 @@ class DoosanPickPlaceNode(Node):
         self._ensure_goal_active(goal_handle)
 
         def _gy_place() -> None:
-            self.motion.move_xy_at_travel(grave_col, grave_row, pose_map)
             self.motion.descend_to_place(pose_map)
             self._open_gripper()
 
@@ -524,8 +568,8 @@ class DoosanPickPlaceNode(Node):
             lambda: self.motion.ascend_to_travel(slow=False, pose_map=pose_map),
         )
 
-        self.robot_graveyard.place_piece(grave_col, grave_row, captured_symbol)
-        self.get_logger().info(f'graveyard state: {self.robot_graveyard.summary()}')
+        graveyard.place_piece(grave_col, grave_row, captured_symbol)
+        self.get_logger().info(f'graveyard state: {graveyard.summary()}')
 
     def _declare_parameters(self) -> None:
         self.declare_parameter('anchor_a1', [590.274, 135.736])
@@ -553,7 +597,7 @@ class DoosanPickPlaceNode(Node):
         self.declare_parameter('z_approach_offset_mm', 25.0)
         self.declare_parameter('robot_id', 'dsr01')
         self.declare_parameter('robot_model', 'm0609')
-        self.declare_parameter('home_joints', [-12.68, 22.54, 36.06, -0.05, 121.43, -12.17])
+        self.declare_parameter('home_joints', [-12.32, 22.41, 36.08, -0.09, 121.46, -13.86])
         self.declare_parameter('publish_board_state', True)
         self.declare_parameter('robot_color', 'black')
         self.declare_parameter('board_orientation', 'standard')
@@ -568,16 +612,27 @@ class DoosanPickPlaceNode(Node):
         self.declare_parameter('graveyard_z_travel_mm', 0.0)
         self.declare_parameter('graveyard_z_offset_mm', 0.0)  # deprecated: use graveyard_z_pick_offset_mm
         self.declare_parameter('graveyard_z_pick_offset_mm', 0.0)
+        # Extra depth applied only when placing a piece INTO the graveyard (not when
+        # picking it back out during restore). Negative = lower.
+        self.declare_parameter('graveyard_z_place_offset_mm', 0.0)
         self.declare_parameter('graveyard_z_travel_extra_mm', 0.0)
         self.declare_parameter('graveyard_a0_joints', [20.12, 41.84, 55.64, -0.03, 82.52, 15.62])
         # Used only when graveyard_a0_anchor_from_joints is false (see joint teach at startup).
-        self.declare_parameter('graveyard_a0_posx', [590.274, 175.736, 271.273, 2.805, 179.832, 2.749])
+        self.declare_parameter(
+            'graveyard_a0_posx', [596.78, 225.25, 270.85, 26.39, -180.0, 21.9]
+        )
         self.declare_parameter('graveyard_a0_anchor_from_joints', False)
         self.declare_parameter('graveyard_teach_velocity', 25.0)
         self.declare_parameter('graveyard_h9_anchor_from_joints', False)
         self.declare_parameter('white_graveyard_col_step_mm', -40.0)
         self.declare_parameter('white_graveyard_row_step_mm', 40.0)
-        self.declare_parameter('white_graveyard_z_pick_offset_mm', -20.0)
+        self.declare_parameter('white_graveyard_z_pick_offset_mm', 0.0)
+        # Extra depth applied only when placing a piece INTO the white graveyard
+        # (a0-h0, a-1/h-1) — not when picking it back out during restore.
+        # Negative = lower. Default 0 — a -3.0 test caused the arm to stall mid
+        # gy_descend (likely pressing into the tray surface); tune in small
+        # (~-1mm) steps with careful physical observation if this is revisited.
+        self.declare_parameter('white_graveyard_z_place_offset_mm', 0.0)
 
     def _init_gripper(self) -> None:
         self.gripper = RG(
@@ -605,18 +660,100 @@ class DoosanPickPlaceNode(Node):
         self._wait_gripper()
 
     def goal_callback(self, goal_request):
-        del goal_request
+        if self._execute_in_progress:
+            self.get_logger().warn('rejecting execute_move — previous goal still running')
+            return GoalResponse.REJECT
+        move = goal_request.move
+        from_col = int(move.from_square.col)
+        from_row = int(move.from_square.row)
+        from_name = f'{chr(ord("a") + from_col)}{from_row + 1}'
+        to_col = int(move.to_square.col)
+        to_row = int(move.to_square.row)
+        to_name = f'{chr(ord("a") + to_col)}{to_row + 1}'
+        raw_uci = f'{from_name}{to_name}{move.promotion or ""}'
+
+        validation = self.board.validate_uci(raw_uci)
+        if not validation.ok:
+            self.get_logger().warn(f'execute_move goal rejected: {validation.message}')
+            return GoalResponse.REJECT
+        from_piece = self.board.piece_at(from_col, from_row)
+        # validate_uci() already requires the move be in board.legal_moves for the
+        # side whose turn it currently is per this node's own FEN — that alone
+        # guarantees from_piece belongs to the side to move, no separate re-check
+        # needed. This used to also require the piece be the robot's own color
+        # (_is_robot_turn/_piece_symbol_is_robot), which made sense back when the
+        # arm only ever played its own moves — but voice commands now have the
+        # arm execute the *human's* moves on their behalf too, on the human's own
+        # turn, so that restriction rejected every voice move with "goal rejected".
+        # #region agent log
+        agent_log(
+            'doosan_pick_place_node.py:goal_callback',
+            'ACCEPT execute_move goal',
+            {
+                'uci': raw_uci,
+                'from_piece': from_piece,
+                'fen': self.board.fen,
+                'human_color': self._human_color(),
+                'robot_color': self._robot_color(),
+                'is_robot_turn': self._is_robot_turn(),
+            },
+            hypothesis_id='B',
+        )
+        # #endregion
         return GoalResponse.ACCEPT
 
     def cancel_callback(self, goal_handle):
         del goal_handle
         return CancelResponse.ACCEPT
 
+    def restore_goal_callback(self, goal_request):
+        # RestoreBoard.Goal has no fields — it must not reuse execute_move's
+        # goal_callback, which unconditionally reads goal_request.move (an
+        # ExecuteMove-only field). Doing so raised an uncaught AttributeError
+        # here on every restore attempt, so the client never got an accept/
+        # reject response and just timed out ("failed to send restore goal").
+        del goal_request
+        if self._execute_in_progress:
+            self.get_logger().warn('rejecting restore_board — a move is already executing')
+            return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
     def _on_hand_in_board(self, msg: Bool) -> None:
+        segment = self._motion_segment
+        hand_immune = segment in _HAND_IMMUNE_SEGMENTS
+        # #region agent log
+        agent_log(
+            'doosan_pick_place_node.py:_on_hand_in_board',
+            'hand topic',
+            {
+                'in_board': bool(msg.data),
+                'safety_paused': self._safety_gate.paused,
+                'fen': self.board.fen,
+                'is_robot_turn': self._is_robot_turn(),
+                'segment': segment.value,
+                'hand_immune': hand_immune,
+            },
+            hypothesis_id='C',
+        )
+        # #endregion
         if msg.data:
+            if hand_immune:
+                # #region agent log
+                agent_log(
+                    'doosan_pick_place_node.py:_on_hand_in_board',
+                    'hand pause ignored (capture/graveyard segment)',
+                    {'segment': segment.value},
+                    hypothesis_id='F',
+                )
+                # #endregion
+                return
+            if self._safety_gate.paused:
+                return
             self._safety_gate.request_pause()
             self.get_logger().info('hand detected on board — motion paused')
         else:
+            if not self._safety_gate.paused:
+                return
             self._safety_gate.resume()
             self.get_logger().info('hand cleared — motion resumed')
 
@@ -624,42 +761,89 @@ class DoosanPickPlaceNode(Node):
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
             raise RuntimeError('canceled')
+        # goal_callback() already validated this move against self.board at accept
+        # time, and self.board's turn only flips once the move is applied at the
+        # end of execution — so it can't legitimately change mid-flight for the
+        # goal that's currently running. This used to also assert _is_robot_turn()
+        # here, which aborted every voice-assisted human move (they execute while
+        # self.board still shows the human's turn, by definition, for their whole
+        # physical execution) — see the same fix in goal_callback().
         self._safety_gate.wait_if_paused()
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
             raise RuntimeError('canceled')
         if self._safety_gate.consume_interrupted():
+            self._replay_attempts += 1
+            if self._replay_attempts > _MAX_REPLAY_ATTEMPTS:
+                goal_handle.abort()
+                # #region agent log
+                agent_log(
+                    'doosan_pick_place_node.py:_ensure_goal_active',
+                    'ABORT too many hand interruptions (flickering signal)',
+                    {
+                        'segment': self._motion_segment.value,
+                        'replay_attempts': self._replay_attempts,
+                    },
+                    hypothesis_id='C',
+                )
+                # #endregion
+                self.get_logger().error(
+                    f'aborting move: {self._replay_attempts} hand interruptions in '
+                    f'{self._motion_segment.value} — hand signal may be flickering, '
+                    'check camera/lighting'
+                )
+                raise RuntimeError('too many hand interruptions')
             self.get_logger().info(
-                f'hand pause cleared — replaying segment {self._motion_segment.value}'
+                f'hand pause cleared — replaying segment {self._motion_segment.value} '
+                f'(attempt {self._replay_attempts}/{_MAX_REPLAY_ATTEMPTS})'
             )
             self.motion.ensure_travel_height(self._segment_ctx.get('pose_map'))
             self._replay_motion_segment(goal_handle)
 
     def handle_reset(self, request, response):
         del request
+        self._execute_in_progress = False
+        self._motion_segment = MotionSegment.NONE
+        self._segment_ctx = {}
+        self._safety_gate.stop_motion()
+        self._safety_gate.request_cancel()
+        self._safety_gate.clear_cancel()
         self._safety_gate.resume()
         self.board.reset()
         self.robot_graveyard.reset()
         self.human_graveyard.reset()
 
+        home_error: str | None = None
+
         def _physical_reset() -> None:
+            nonlocal home_error
             try:
                 self._open_gripper()
                 self._go_home()
             except Exception as exc:  # noqa: BLE001
+                home_error = str(exc)
                 self.get_logger().warn(f'reset homing failed: {exc}')
 
         worker = threading.Thread(target=_physical_reset, daemon=True, name='reset_home')
         worker.start()
         worker.join(timeout=12.0)
         if worker.is_alive():
+            home_error = home_error or 'go_home timed out (12s)'
             self.get_logger().warn(
                 'reset go_home timed out — logical board reset still applied'
             )
 
         self._publish_board_state('board reset to starting position')
         response.success = True
-        response.message = 'board reset'
+        # Logical board reset always succeeds independently of the physical arm, but a
+        # homing failure/timeout used to be swallowed into a ROS log line only — the UI
+        # showed a plain "board reset" success with no hint the arm never moved. Surface
+        # it in the response message instead.
+        response.message = (
+            'board reset'
+            if home_error is None
+            else f'board reset (로봇 홈 복귀 실패: {home_error})'
+        )
         return response
 
     def handle_set_board(self, request, response):
@@ -751,7 +935,7 @@ class DoosanPickPlaceNode(Node):
                 fen_before = str(entry.get('fen_before', '')).strip()
                 pick = entry.get('graveyard_pick')
                 if pick is not None and pick.get('side'):
-                    self._ensure_graveyard_calibrated(str(pick['side']), return_home=False)
+                    self._graveyard_pose_map_for(str(pick['side']))
                 mode = str(entry.get('mode', 'uci')).strip().lower()
                 if mode == 'physical':
                     from_sq = str(entry.get('from_square', '')).strip()
@@ -803,6 +987,41 @@ class DoosanPickPlaceNode(Node):
         response.message = 'retreated to home joints'
         return response
 
+    def handle_user_stop(self, request, response):
+        del request
+        self._safety_gate.request_pause()
+        self.get_logger().info('user stop — motion halted')
+        response.success = True
+        response.message = 'stopped'
+        return response
+
+    def handle_user_stop_resume(self, request, response):
+        del request
+        self._safety_gate.resume()
+        self.get_logger().info('user stop resume — motion gate open')
+        response.success = True
+        response.message = 'resumed'
+        return response
+
+    def handle_user_stop_abort(self, request, response):
+        del request
+        self._execute_in_progress = False
+        self._motion_segment = MotionSegment.NONE
+        self._segment_ctx = {}
+        self._safety_gate.stop_motion()
+        self._safety_gate.request_cancel()
+        try:
+            self._open_gripper()
+            self._go_home()
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'user stop abort homing failed: {exc}')
+        self._safety_gate.clear_cancel()
+        self._safety_gate.resume()
+        self.get_logger().info('user stop abort — canceled and homed')
+        response.success = True
+        response.message = 'aborted'
+        return response
+
     def _capture_square_to_graveyard(
         self,
         col: int,
@@ -817,6 +1036,19 @@ class DoosanPickPlaceNode(Node):
         if not self._use_graveyard_for_capture(captured_symbol):
             raise RuntimeError('graveyard disabled; cannot capture piece')
         captured_symbol = self._resolve_captured_symbol(captured_symbol)
+        # #region agent log
+        agent_log(
+            'doosan_pick_place_node.py:_capture_square_to_graveyard',
+            'capture to graveyard start',
+            {
+                'col': col,
+                'row': row,
+                'symbol': captured_symbol,
+                'fen': self.board.fen,
+            },
+            hypothesis_id='F',
+        )
+        # #endregion
 
         feedback.progress = progress_start
         feedback.status = 'removing captured piece'
@@ -913,6 +1145,18 @@ class DoosanPickPlaceNode(Node):
         self._run_motion_step(goal_handle, lambda: self.motion.ascend_to_travel(slow=False))
 
     def execute_move(self, goal_handle):
+        self._execute_in_progress = True
+        self._safety_gate.clear_cancel()
+        self._safety_gate.resume()
+        self._replay_attempts = 0
+        try:
+            return self._execute_move_impl(goal_handle)
+        finally:
+            self._execute_in_progress = False
+            self._motion_segment = MotionSegment.NONE
+            self._segment_ctx = {}
+
+    def _execute_move_impl(self, goal_handle):
         move = goal_handle.request.move
         from_col = int(move.from_square.col)
         from_row = int(move.from_square.row)
@@ -929,6 +1173,10 @@ class DoosanPickPlaceNode(Node):
             result.success = False
             result.message = validation.message
             return result
+        # No separate robot-turn/robot-piece re-check here — validate_uci() already
+        # requires the move be legal for whoever's turn self.board currently shows,
+        # which now legitimately includes the human's own turn for voice-assisted
+        # moves (see goal_callback()/_ensure_goal_active()).
 
         feedback = ExecuteMove.Feedback()
         try:
@@ -1012,12 +1260,31 @@ class DoosanPickPlaceNode(Node):
             result.message = 'move completed'
             return result
         except RuntimeError as exc:
-            if str(exc) == 'canceled':
+            msg = str(exc)
+            if msg in ('canceled', 'safety gate canceled'):
+                # goal_handle.canceled() already called at the raise site.
                 result = ExecuteMove.Result()
                 result.success = False
                 result.message = 'canceled'
                 return result
-            raise
+            if msg in ('not robot turn', 'too many hand interruptions'):
+                # goal_handle.abort() already called at the raise site.
+                result = ExecuteMove.Result()
+                result.success = False
+                result.message = msg
+                return result
+            # Any other RuntimeError (e.g. "movel rejected by controller" from a
+            # DSR command the safety/velocity limits refused) has NOT yet
+            # terminated the goal — fall through to the same abort+fail handling
+            # as an unexpected exception instead of letting it escape uncaught
+            # (which used to leave the goal in limbo with no clean Result, same
+            # class of bug as the recursion crash this replaced).
+            self.get_logger().error(f'move failed: {exc}')
+            goal_handle.abort()
+            result = ExecuteMove.Result()
+            result.success = False
+            result.message = msg
+            return result
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f'move failed: {exc}')
             goal_handle.abort()
@@ -1039,12 +1306,22 @@ class DoosanPickPlaceNode(Node):
 
         self._open_gripper()
         if move.kind == 'graveyard_to_board':
-            self.motion.pick_piece_at(
-                move.from_col,
-                move.from_row,
-                self._close_gripper,
-                pose_map=graveyard_map,
+            # pick_piece_at(pose_map=graveyard_map) would immediately re-level to
+            # the graveyard's own (potentially lower) travel height as its first
+            # step, at whatever XY the arm is coming from — often still over the
+            # board from the previous restore move — and cross the rest of the
+            # board at that unsafe height to reach the graveyard slot. Ensure
+            # board-safe height first, cross to the graveyard slot's XY at that
+            # height, and only switch down to the graveyard's calibration once
+            # already positioned there.
+            self.motion.ensure_travel_height(self.pose_map)
+            self.motion.move_xy_at_height(
+                move.from_col, move.from_row, graveyard_map, self.pose_map.z_travel_mm
             )
+            self.motion.ensure_travel_height(graveyard_map)
+            self.motion.descend_to_pick(graveyard_map)
+            self._close_gripper()
+            self.motion.ascend_to_travel(pose_map=graveyard_map)
             self.motion.ensure_travel_height(self.pose_map)
             self.motion.place_piece_at(
                 move.to_col,
@@ -1054,12 +1331,21 @@ class DoosanPickPlaceNode(Node):
             )
         elif move.kind == 'board_to_graveyard':
             self.motion.pick_piece_at(move.from_col, move.from_row, self._close_gripper)
-            self.motion.place_piece_at(
-                move.to_col,
-                move.to_row,
-                self._open_gripper,
-                pose_map=graveyard_map,
+            # pick_piece_at ends at the board's travel height over the board
+            # pick square. place_piece_at(pose_map=graveyard_map) would
+            # immediately re-level to the *graveyard's* travel height (its own
+            # first step) before flying to the graveyard slot — crossing back
+            # over the rest of the board at that potentially lower/uncleared
+            # height and risking a collision with pieces still on it. Cross at
+            # the board-safe height instead, and only switch down to the
+            # graveyard's own calibration once already positioned over the slot.
+            self.motion.move_xy_at_height(
+                move.to_col, move.to_row, graveyard_map, self.pose_map.z_travel_mm
             )
+            self.motion.ensure_travel_height(graveyard_map)
+            self.motion.descend_to_place(graveyard_map)
+            self._open_gripper()
+            self.motion.ascend_to_travel(slow=False, pose_map=graveyard_map)
         elif move.kind == 'board_to_board':
             self.motion.pick_piece_at(move.from_col, move.from_row, self._close_gripper)
             self.motion.place_piece_at(move.to_col, move.to_row, self._open_gripper)
@@ -1077,7 +1363,19 @@ class DoosanPickPlaceNode(Node):
         feedback = RestoreBoard.Feedback()
         result = RestoreBoard.Result()
         try:
-            if not board_needs_restore(self.board, self.robot_graveyard, self.human_graveyard):
+            needs = board_needs_restore(self.board, self.robot_graveyard, self.human_graveyard)
+            agent_log(
+                'doosan_pick_place_node.py:execute_restore_board',
+                'needs_restore check',
+                {
+                    'needs_restore': needs,
+                    'fen': self.board.fen,
+                    'robot_graveyard_slots': list(self.robot_graveyard.slots),
+                    'human_graveyard_slots': list(self.human_graveyard.slots),
+                },
+                hypothesis_id='G',
+            )
+            if not needs:
                 result.success = True
                 result.message = 'already at starting position'
                 goal_handle.succeed()
@@ -1086,7 +1384,26 @@ class DoosanPickPlaceNode(Node):
             moves = plan_board_restore(self.board, self.robot_graveyard, self.human_graveyard)
             total = len(moves)
             self.get_logger().info(f'restore board: {total} planned moves')
+            agent_log(
+                'doosan_pick_place_node.py:execute_restore_board',
+                'restore plan built',
+                {
+                    'total_moves': total,
+                    'moves': [
+                        f'{m.kind}:{m.symbol}:({m.from_col},{m.from_row})->({m.to_col},{m.to_row})'
+                        for m in moves
+                    ],
+                },
+                hypothesis_id='G',
+            )
 
+            # The arm must reach into the board/graveyard area for every restore
+            # move, same as captures — without marking this hand-immune, restore
+            # never set _motion_segment at all, so ANY hand-detection blip (even
+            # a false positive with no hand actually present) raised
+            # MotionInterrupted, which nothing here caught or retried: the whole
+            # restore aborted mid-sequence with no way to know how far it got.
+            self._motion_segment = MotionSegment.RESTORE
             for index, move in enumerate(moves):
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
@@ -1116,14 +1433,28 @@ class DoosanPickPlaceNode(Node):
 
             result.success = True
             result.message = f'board restored ({total} moves)'
+            agent_log(
+                'doosan_pick_place_node.py:execute_restore_board',
+                'restore completed',
+                {'total_moves': total},
+                hypothesis_id='G',
+            )
             goal_handle.succeed()
             return result
         except Exception as exc:  # noqa: BLE001
             self.get_logger().error(f'restore board failed: {exc}')
+            agent_log(
+                'doosan_pick_place_node.py:execute_restore_board',
+                'restore FAILED',
+                {'error': str(exc)},
+                hypothesis_id='G',
+            )
             goal_handle.abort()
             result.success = False
             result.message = str(exc)
             return result
+        finally:
+            self._motion_segment = MotionSegment.NONE
 
     def _publish_board_state(self, message: str) -> None:
         if not self._should_publish_board_state():

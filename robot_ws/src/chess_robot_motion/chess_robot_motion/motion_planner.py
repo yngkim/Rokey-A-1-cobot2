@@ -15,6 +15,7 @@ class SquarePoseMap(Protocol):
     z_pick_mm: float
     z_travel_mm: float
     fixed_orientation: list[float]
+    # z_place_mm is optional (graveyard-only); board pose maps fall back to z_pick_mm.
 
     def square_center_xy(self, col: int, row: int) -> tuple[float, float]: ...
 
@@ -63,7 +64,23 @@ class ZFirstMotionPlanner:
     ) -> None:
         if self.safety_gate is not None:
             self.safety_gate.wait_if_paused()
-        self.movel(posx, vel=vel if vel is not None else self.velocity, acc=acc if acc is not None else self.acceleration)
+        move_vel = vel if vel is not None else self.velocity
+        move_acc = acc if acc is not None else self.acceleration
+        ret = self.movel(posx, vel=move_vel, acc=move_acc)
+        # dsr_bootstrap's movel() returns 0 on success, -1 if the DSR controller
+        # rejected the command (e.g. vel/acc exceeding a configured safety limit,
+        # joint limit, singularity). This used to be silently ignored — the caller
+        # kept going as if the arm had moved, so mwait() returned almost instantly
+        # (nothing was in motion), the sequence continued to completion (gripper
+        # actuation etc.), and the logical board state got updated even though the
+        # physical arm never moved / stalled where it last succeeded. Fail loudly
+        # instead so the goal aborts and the UI/board state never desyncs from
+        # physical reality.
+        if ret not in (0, None):
+            raise RuntimeError(
+                f'movel rejected by controller (ret={ret}, vel={move_vel}, acc={move_acc}) '
+                '— check DSR safety velocity/acceleration limits'
+            )
         self.mwait()
         if self.safety_gate is not None and self.safety_gate.consume_interrupted():
             raise MotionInterrupted('motion interrupted by hand safety pause')
@@ -97,6 +114,23 @@ class ZFirstMotionPlanner:
         pmap = self._pmap(pose_map)
         target_x, target_y = pmap.square_center_xy(col, row)
         self._move([target_x, target_y, self._travel_z(pose_map), *pmap.fixed_orientation])
+
+    def move_xy_at_height(self, col: int, row: int, pose_map: SquarePoseMap, z: float) -> None:
+        """Move to pose_map's square center at an explicit Z, not pose_map's own
+        travel height.
+
+        For crossing between two regions with different travel-height
+        calibrations (e.g. board <-> graveyard): compute the horizontal target
+        from the destination's pose map, but travel at whichever height is safe
+        for the crossing (normally the board's, since board pieces are what's in
+        the way), only switching down to the destination's own travel height
+        once already positioned there. Using ensure_travel_height(dest_pose_map)
+        before the crossing looks similar but is wrong — it changes height
+        immediately, so the horizontal flight still happens at the destination's
+        (potentially lower/uncleared) height, not the safe one.
+        """
+        target_x, target_y = pose_map.square_center_xy(col, row)
+        self._move([target_x, target_y, z, *pose_map.fixed_orientation])
 
     def _descend_to_z(
         self,
@@ -137,7 +171,7 @@ class ZFirstMotionPlanner:
         """Lower Z to place height (single smooth descent)."""
         pmap = self._pmap(pose_map)
         self._descend_to_z(
-            pmap.z_pick_mm,
+            getattr(pmap, 'z_place_mm', pmap.z_pick_mm),
             approach_vel=self.pick_velocity,
             approach_acc=self.pick_acceleration,
             final_vel=self.place_velocity,

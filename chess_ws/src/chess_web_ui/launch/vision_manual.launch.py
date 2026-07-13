@@ -72,7 +72,7 @@ def generate_launch_description():
         'hand_confirm_cooldown_sec',
         default_value='1.0',
     )
-    auto_detect_moves_arg = DeclareLaunchArgument('auto_detect_moves', default_value='true')
+    auto_detect_moves_arg = DeclareLaunchArgument('auto_detect_moves', default_value='false')
     auto_detect_stable_frames_arg = DeclareLaunchArgument(
         'auto_detect_stable_frames',
         default_value='4',
@@ -95,6 +95,7 @@ def generate_launch_description():
         parameters=[{
             'auto_detect_moves': LaunchConfiguration('auto_detect_moves'),
             'auto_detect_stable_frames': LaunchConfiguration('auto_detect_stable_frames'),
+            'human_color': LaunchConfiguration('human_color'),
         }],
     )
 

@@ -37,9 +37,29 @@ body {
   padding: 32px 16px;
 }
 
+.lobby-hero {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 8px;
+}
+
+.lobby-logo {
+  width: 64px;
+  height: 64px;
+  flex-shrink: 0;
+}
+
 .lobby h1 {
-  margin: 0 0 8px;
-  font-size: 2rem;
+  margin: 0;
+  font-size: 2.25rem;
+  letter-spacing: 0.02em;
+}
+
+.lobby-tagline {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 0.95rem;
 }
 
 .lobby-sub {
@@ -134,6 +154,103 @@ body {
 .start-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.saved-games-section {
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 24px;
+}
+
+.saved-games-section h2 {
+  margin: 0 0 8px;
+  font-size: 1.1rem;
+}
+
+.resume-btn {
+  width: 100%;
+  padding: 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(255, 140, 66, 0.12);
+  color: var(--accent);
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.resume-btn:hover:not(:disabled) {
+  background: rgba(255, 140, 66, 0.2);
+}
+
+.resume-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.saved-games-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.saved-games-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.saved-games-list li.saved-game-active {
+  border-color: var(--accent);
+}
+
+.saved-game-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.saved-game-meta strong {
+  font-size: 0.95rem;
+}
+
+.saved-game-id {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-family: monospace;
+}
+
+.saved-game-load-btn {
+  flex-shrink: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.saved-game-load-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.saved-games-error {
+  color: #fa412d;
+  margin: 0 0 8px;
+  font-size: 0.9rem;
 }
 
 .tts-settings {
@@ -556,6 +673,11 @@ body {
   font-size: 0.72rem;
   color: var(--text-muted);
   line-height: 1.35;
+}
+
+.twin-hand-hint.twin-hand-warn {
+  color: var(--danger, #d64545);
+  font-weight: 600;
 }
 
 .sideview-detection-list {

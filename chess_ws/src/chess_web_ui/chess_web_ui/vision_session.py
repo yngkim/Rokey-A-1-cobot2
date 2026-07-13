@@ -9,12 +9,18 @@ import chess
 from chess_game.board_utils import index_to_square_name, occupancy_from_fen, sanitize_depth_cells
 from chess_game.game_state import GameState
 from chess_game.move_matcher import MoveMatcher
-from chess_game.move_resolve import promotion_notice, promotion_piece_char, resolve_legal_uci
+from chess_game.move_resolve import promotion_notice, promotion_piece_char, resolve_legal_uci, resolve_legal_uci_full
 from chess_game.occupancy_diff import (
     castling_diff_pattern,
     detect_move_from_diff,
     infer_captured_piece,
 )
+
+try:
+    from chess_web_ui.agent_debug_log import agent_log
+except ImportError:
+    def agent_log(*_args, **_kwargs) -> None:
+        pass
 
 
 def _departed_arrived(
@@ -49,6 +55,47 @@ def _no_move_outcome(
     )
 
 
+def _prune_departed_noise(
+    departed: list[str],
+    arrived: list[str],
+    fen: str,
+    current_cells: list[bool] | None = None,
+) -> list[str]:
+    """Drop stale depth ghosts (e.g. a2) when a real from→to move is visible."""
+    if not departed:
+        return departed
+    if len(arrived) == 1:
+        to_sq = arrived[0]
+        legal_from = [
+            from_sq
+            for from_sq in departed
+            if resolve_legal_uci_full(f'{from_sq}{to_sq}', fen) is not None
+        ]
+        if len(legal_from) == 1:
+            return legal_from
+    if len(departed) == 1 and not arrived:
+        try:
+            from_square = chess.parse_square(departed[0])
+        except ValueError:
+            return departed
+        board = chess.Board(fen)
+        if board.piece_at(from_square) is None:
+            return departed
+        if current_cells is not None:
+            # A capture onto a square that is occupied both before and after
+            # (piece taken, capturer arrives) never shows up as "arrived" — it's
+            # a real move, not a depth-sensor ghost. Only prune when no legal
+            # move from here still explains the diff.
+            has_legal_destination = any(
+                move.from_square == from_square and current_cells[move.to_square]
+                for move in board.legal_moves
+            )
+            if has_legal_destination:
+                return departed
+        return []
+    return departed
+
+
 def _has_minimum_move_evidence(
     departed: list[str],
     arrived: list[str],
@@ -58,6 +105,15 @@ def _has_minimum_move_evidence(
         return False
     if len(departed) == 2 and len(arrived) == 0:
         return castling_diff_pattern(departed, arrived, fen)
+    if len(departed) == 1 and len(arrived) == 0:
+        # A single-square capture (piece taken, capturer lands on the same
+        # square) never produces an "arrived" signal, so it can only ever reach
+        # this point with exactly one piece of evidence. By the time we get
+        # here, _prune_departed_noise has already confirmed this departure
+        # matches a real legal move rather than depth-sensor noise, so trust
+        # it instead of demanding >=2 evidence points that no single-square
+        # capture could ever satisfy.
+        return True
     return len(departed) + len(arrived) >= 2
 
 
@@ -231,7 +287,19 @@ class VisionSession:
         fen_before = self.game.fen
         filtered = self._filter_cells(cells, conf, fen_before)
         departed, arrived = _departed_arrived(baseline, filtered)
+        departed = _prune_departed_noise(departed, arrived, fen_before, filtered)
         if filtered == baseline or not _has_minimum_move_evidence(departed, arrived, fen_before):
+            agent_log(
+                'vision_session.py:apply_player_move_scan',
+                'no move evidence',
+                {
+                    'departed': departed,
+                    'arrived': arrived,
+                    'fen_before': fen_before,
+                    'used_fen_baseline': used_fen_baseline,
+                },
+                hypothesis_id='D',
+            )
             return _no_move_outcome(
                 baseline=baseline,
                 filtered=filtered,
@@ -255,6 +323,12 @@ class VisionSession:
                 if outcome is not None:
                     baseline_note = ' (fen baseline)' if used_fen_baseline else ''
                     outcome.message = f'{outcome.message}{baseline_note}'
+                    agent_log(
+                        'vision_session.py:apply_player_move_scan',
+                        'diff move ok',
+                        {'uci': outcome.uci, 'fen_before': fen_before},
+                        hypothesis_id='D',
+                    )
                     return outcome
                 if self._promotion_candidates(fen_before, diff.from_square, diff.to_square):
                     return ScanOutcome(

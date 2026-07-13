@@ -43,8 +43,8 @@ def test_human_black_robot_white_graveyard_negative_col_step():
     assert robot_graveyard_side('black') == 'white'
     assert robot_gy.side == 'white'
 
-    anchor = [590.274, 175.736, 271.273, 2.805, 179.832, 2.749]
+    anchor = [596.78, 225.25, 270.85, 26.39, -180.0, 21.9]
     gmap = GraveyardPoseMap(anchor, col_step_mm=-40.0, row_step_mm=40.0, anchor_col=0)
-    assert gmap.square_center_xy(0, 0) == (590.274, 175.736)
-    assert gmap.square_center_xy(1, 0) == (550.274, 175.736)
-    assert gmap.square_center_xy(7, 0) == (310.274, 175.736)
+    assert gmap.square_center_xy(0, 0) == (596.78, 225.25)
+    assert gmap.square_center_xy(1, 0) == (556.78, 225.25)
+    assert gmap.square_center_xy(0, 1) == (596.78, 265.25)

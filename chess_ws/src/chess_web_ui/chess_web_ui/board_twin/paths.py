@@ -6,7 +6,14 @@ import os
 from pathlib import Path
 
 DEFAULT_SIDE_MODEL_REL = Path('model/weights/chess_final_side1_best.pt')
-DEFAULT_HAND_MODEL_REL = Path('hand_yolo26_project/runs_stage1_open/weights/best.pt')
+# stage1 is only the generic/open pretrain (public hand images, never saw this
+# rig's camera angle, lighting, or the robot gripper) — val mAP50 0.71,
+# precision 0.75, recall 0.67 on its own val set. stage2 finetunes stage1's
+# weights on a custom dataset captured from this actual setup and is
+# dramatically more accurate here: mAP50 0.97, precision 0.94, recall 0.97.
+# Deploying stage1 was the direct cause of persistent false-positive hand
+# detections (e.g. the moving gripper/pieces mistaken for a hand).
+DEFAULT_HAND_MODEL_REL = Path('hand_yolo26_project/runs_stage2_finetune/weights/best.pt')
 HF_SIDE_MODEL_FALLBACK = 'yamero999/chess-piece-detection-yolo11n'
 
 
