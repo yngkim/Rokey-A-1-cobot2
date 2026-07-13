@@ -4040,6 +4040,16 @@ class WebBridgeNode(Node):
         legal, promo_required, resolve_msg = resolve_voice_move(fen_before, move)
 
         if promo_required:
+            # confirm_player_promotion() always resolves the chosen piece via
+            # vision_game_node's own internal session FEN (ConfirmPlayerMove has
+            # no fen field), not web_bridge's fen_before — that session is never
+            # told about a voice move until after it fully completes. Without
+            # this sync it stays on the pre-move FEN, so resolving e.g. "e7e8q"
+            # against it fails ("illegal promotion") even though the move here
+            # is legal against the real current position.
+            sync_ok, sync_msg = self._sync_logical_board(fen_before)
+            if not sync_ok:
+                self.get_logger().warn(f'logical board sync before promotion failed: {sync_msg}')
             self._pending_promotion = {
                 'from': from_sq,
                 'to': to_sq,

@@ -54,7 +54,7 @@ def generate_launch_description():
     _default_hand_model = os.path.join(
         _repo_root,
         'hand_yolo26_project',
-        'runs_stage1_open',
+        'runs_stage2_finetune',
         'weights',
         'best.pt',
     )
