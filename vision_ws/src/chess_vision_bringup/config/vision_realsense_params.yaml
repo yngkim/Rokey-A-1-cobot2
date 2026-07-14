@@ -21,7 +21,11 @@ occupancy_node:
     heuristic_fallback: true
     board_flip_files: true
     depth_occupancy_enabled: true
-    empty_depth_reference_path: "/home/rokey/vision_ws/src/chess_vision_bringup/config/empty_board_depth.npz"
+    # Left empty on purpose — vision_realsense.launch.py overrides this with a
+    # path resolved from the installed package share dir (portable across
+    # machines/users). Only needed here if launching occupancy_node without
+    # that launch file.
+    empty_depth_reference_path: ""
     depth_occupancy_threshold_mm: 2.5
     depth_occupancy_min_conf: 0.18
     # current frame: lower percentile = more sensitive to piece height (empty ref stays median)

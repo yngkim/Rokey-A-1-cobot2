@@ -50,7 +50,13 @@ def generate_launch_description():
         executable='occupancy_node',
         name='occupancy_node',
         output='screen',
-        parameters=[LaunchConfiguration('vision_params')],
+        parameters=[
+            LaunchConfiguration('vision_params'),
+            # vision_realsense_params.yaml intentionally leaves this blank (see
+            # its comment) — resolve it from the installed package share dir so
+            # depth-based occupancy doesn't lose its empty-board reference.
+            {'empty_depth_reference_path': os.path.join(vision_share, 'config', 'empty_board_depth.npz')},
+        ],
         condition=IfCondition(LaunchConfiguration('start_vision')),
     )
 

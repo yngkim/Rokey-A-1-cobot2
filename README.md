@@ -62,6 +62,52 @@ graph TB
     WEBUI -- "ExecuteMove/RestoreBoard 액션" --> PICK
     PICK --> MOTION --> DSR
     BRING -. 파라미터 .-> PICK
+
+    classDef vision fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
+    classDef game fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
+    classDef robot fill:#fff3e0,stroke:#ef6c00,color:#0d1b2a;
+    classDef hw fill:#f5f5f5,stroke:#616161,color:#0d1b2a;
+
+    class RS,OCC,PC vision
+    class ENGINE,GAME,WEBUI,VOICE,HAND game
+    class MOTION,PICK,BRING robot
+    class DSR,WEBCAM hw
+
+    style vision_ws fill:#f8fbff,stroke:#1565c0
+    style chess_ws fill:#f6fbf6,stroke:#2e7d32
+    style robot_ws fill:#fffaf3,stroke:#ef6c00
+    style hw fill:#fafafa,stroke:#616161
+```
+
+### 하드웨어 구성
+
+```mermaid
+graph LR
+    subgraph PC["Host PC — Ubuntu 22.04"]
+        ROS[ROS2 Humble 노드]
+        SF[Stockfish]
+        API[FastAPI + React 서버]
+    end
+
+    subgraph SENSE["센서"]
+        RS2[RealSense D400<br/>탑뷰 depth]
+        CAM[사이드 웹캠<br/>예: Logitech C270]
+    end
+
+    subgraph CELL["로봇 셀"]
+        CTRL[Doosan DSR 컨트롤러<br/>host:port TCP]
+        ARM[M0609 팔 + RG2 그리퍼]
+        GY["그레이브야드<br/>a0: 백 / h9: 흑"]
+    end
+
+    PC -- USB --> SENSE
+    PC -- "Ethernet (TCP :12345)" --> CTRL
+    CTRL --> ARM
+    ARM -. 캡처 기물 배치 .-> GY
+
+    style PC fill:#f8fbff,stroke:#1565c0
+    style SENSE fill:#f6fbf6,stroke:#2e7d32
+    style CELL fill:#fffaf3,stroke:#ef6c00
 ```
 
 ### 한 수(턴) 진행 흐름
@@ -77,7 +123,39 @@ flowchart LR
     F --> G[Stockfish 다음 수 계산]
     G --> H[로봇팔 pick-and-place<br/>캡처 시 그레이브야드行]
     H --> A
+
+    classDef turn fill:#ede7f6,stroke:#5e35b1,color:#0d1b2a;
+    classDef sense fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
+    classDef decide fill:#fff9c4,stroke:#f9a825,color:#0d1b2a;
+    classDef act fill:#fff3e0,stroke:#ef6c00,color:#0d1b2a;
+
+    class A,H turn
+    class C,D sense
+    class B decide
+    class E,F,G act
 ```
+
+### 인터페이스 구조
+
+UI부터 하드웨어까지 REST API · ROS2 Topic/Service/Action 네 종류로 연결됩니다 (`web_bridge.py`, `vision_game_node.py`, `doosan_pick_place_node.py` 기준).
+
+| 종류 | 예시 | 용도 |
+|---|---|---|
+| REST API | `POST /api/move`, `POST /api/voice-move`, `GET /api/board`, `POST /api/games/save` | React 웹 UI ↔ FastAPI 백엔드 |
+| ROS2 Topic | `chess/board_state`, `chess/hand_in_board`, `vision/live_occupancy`, `chess/game_snapshot` | 비전 인식·손 감지 결과 스트리밍 |
+| ROS2 Service | `chess/confirm_player_move`, `chess/scan_initial`, `chess/apply_robot_move`, `robot/user_stop` | 동기 요청/응답 (수 확정, 초기 스캔, 긴급 정지) |
+| ROS2 Action | `robot/execute_move`, `robot/restore_board` | 장시간 로봇 pick-and-place 작업 (진행률 피드백 포함) |
+
+### 데이터 저장
+
+`chess_web_ui`는 SQLite(`game_store.py`) 단일 `games` 테이블에 대국 상태를 저장해 재시작 후에도 이어서 진행할 수 있습니다.
+
+| 구분 | 컬럼 예시 |
+|---|---|
+| 메타 | `id`, `created_at`, `updated_at`, `is_active` |
+| 게임 상태 | `fen`, `human_color`, `difficulty`, `game_phase`, `eval_cp`, `bot_status` |
+| 기물 데이터 | `graveyard_slots_json`, `human_captures_json`, `robot_captures_json` |
+| 기보 | `move_history_json`, `ply_counter`, `last_bot_move` |
 
 ## 운영체제 / 실행 환경
 

@@ -49,6 +49,14 @@ def generate_launch_description():
             executable='occupancy_node',
             name='occupancy_node',
             output='screen',
-            parameters=[LaunchConfiguration('params_file')],
+            parameters=[
+                LaunchConfiguration('params_file'),
+                # Overrides the yaml's empty_depth_reference_path with one resolved
+                # from the installed package share dir, not a hardcoded absolute
+                # path — the yaml value only ever worked on this one machine
+                # because a leftover pre-monorepo `~/vision_ws` happened to have
+                # an identical copy at the same hardcoded path.
+                {'empty_depth_reference_path': os.path.join(pkg_share, 'config', 'empty_board_depth.npz')},
+            ],
         ),
     ])

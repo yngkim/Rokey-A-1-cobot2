@@ -25,7 +25,12 @@ def _default_params_path() -> str:
         share = get_package_share_directory('chess_vision_bringup')
         return str(Path(share) / 'config' / 'vision_realsense_params.yaml')
     except Exception:  # noqa: BLE001
-        return '/home/rokey/vision_ws/src/chess_vision_bringup/config/vision_realsense_params.yaml'
+        # __file__ = .../vision_ws/src/chess_occupancy/chess_occupancy/this_file.py
+        # parents[2] = .../vision_ws/src
+        return str(
+            Path(__file__).resolve().parents[2]
+            / 'chess_vision_bringup' / 'config' / 'vision_realsense_params.yaml'
+        )
 
 
 def _load_params_from_yaml(path: str) -> dict:
